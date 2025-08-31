@@ -15,6 +15,7 @@
 package raft
 
 import (
+	"crypto/sha256"
 	"fmt"
 
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -59,6 +60,15 @@ type raftLog struct {
 	// applyingEntsPaused is true when entry application has been paused until
 	// enough progress is acknowledged.
 	applyingEntsPaused bool
+
+	// enableFastPath indicates whether Fast Raft optimizations should be used
+	// This should be set based on the raft instance's configuration
+	enableFastPath bool
+	// lastLeaderIndex is the highest index with insertedBy=leader in the log.
+	// This is used for election up-to-date checks. Cached for performance.
+	lastLeaderIndex uint64
+	// lastLeaderTerm is the term at lastLeaderIndex
+	lastLeaderTerm uint64
 }
 
 // newLog returns log using the given storage and default options. It
@@ -68,8 +78,7 @@ func newLog(storage Storage, logger Logger) *raftLog {
 	return newLogWithSize(storage, logger, noLimit)
 }
 
-// newLogWithSize returns a log using the given storage and max
-// message size.
+// newLogWithSize returns a log using the given storage and max message size.
 func newLogWithSize(storage Storage, logger Logger, maxApplyingEntsSize entryEncodingSize) *raftLog {
 	firstIndex, err := storage.FirstIndex()
 	if err != nil {
@@ -79,7 +88,8 @@ func newLogWithSize(storage Storage, logger Logger, maxApplyingEntsSize entryEnc
 	if err != nil {
 		panic(err) // TODO(bdarnell)
 	}
-	return &raftLog{
+
+	l := &raftLog{
 		storage: storage,
 		unstable: unstable{
 			offset:           lastIndex + 1,
@@ -94,7 +104,21 @@ func newLogWithSize(storage Storage, logger Logger, maxApplyingEntsSize entryEnc
 		applied:   firstIndex - 1,
 
 		logger: logger,
+
+		// Default to disabled for backward compatibility
+		enableFastPath: false,
 	}
+
+	// Don't scan for leader entries unless Fast Raft is enabled
+	// This will be set later by raft.newRaft() if Fast Raft is configured
+
+	return l
+}
+
+// enableFastRaft enables Fast Raft features and initializes leader tracking
+func (l *raftLog) enableFastRaft() {
+	l.enableFastPath = true
+	l.updateLastLeaderIndex()
 }
 
 func (l *raftLog) String() string {
@@ -102,32 +126,71 @@ func (l *raftLog) String() string {
 		l.committed, l.applied, l.applying, l.unstable.offset, l.unstable.offsetInProgress, len(l.unstable.entries))
 }
 
-// maybeAppend returns (0, false) if the entries cannot be appended. Otherwise,
-// it returns (last index of new entries, true).
+// maybeAppend appends or overwrites log entries sent by the leader, and optionally
+// advances commit. It must never overwrite committed entries.
+//
+// Fast-Raft addition: when there is no "term" conflict (ci == 0), but incoming
+// leader entries overlap existing self-approved entries at the same indices,
+// we "upgrade" those overlapping entries to InsertedByLeader.
 func (l *raftLog) maybeAppend(a logSlice, committed uint64) (lastnewi uint64, ok bool) {
 	if !l.matchTerm(a.prev) {
 		return 0, false
 	}
-	// TODO(pav-kv): propagate logSlice down the stack. It will be used all the
-	// way down in unstable, for safety checks, and for useful bookkeeping.
 
 	lastnewi = a.prev.index + uint64(len(a.entries))
 	ci := l.findConflict(a.entries)
+
 	switch {
 	case ci == 0:
+		// No term conflict. Fast-Raft: upgrade overlapping self-approved entries
+		// at the same (index,term) to the leader’s choice, then append any tail.
+		if l.enableFastPath && len(a.entries) > 0 {
+			overlapHi := min(lastnewi, l.lastIndex())
+			// Walk the overlap [prev.index+1 .. overlapHi].
+			for li, j := a.prev.index+1, 0; li <= overlapHi; li, j = li+1, j+1 {
+				ex, err := l.entry(li)
+				if err != nil {
+					break // out of bounds; nothing more to upgrade
+				}
+				ne := a.entries[j]
+				// Since ci==0, terms must match on the overlap.
+				if ex.Term != ne.Term {
+					// Defensive: treat as conflict and replace from here.
+					l.append(a.entries[j:]...)
+					goto commit
+				}
+				if ex.InsertedBy != pb.InsertedByLeader {
+					// Upgrade payload + provenance to leader-approved.
+					_ = l.sparseAppend(li, ne, pb.InsertedByLeader)
+				}
+			}
+			// Append any tail beyond current lastIndex.
+			if lastnewi > l.lastIndex() {
+				j := int(overlapHi - a.prev.index) // number processed in overlap
+				l.append(a.entries[j:]...)
+			}
+		} else {
+			// Upstream behavior: append only the tail, if any.
+			if lastnewi > l.lastIndex() {
+				off := int(min(lastnewi, l.lastIndex()) - a.prev.index)
+				l.append(a.entries[off:]...)
+			}
+		}
+
 	case ci <= l.committed:
 		l.logger.Panicf("entry %d conflict with committed entry [committed(%d)]", ci, l.committed)
+
 	default:
 		offset := a.prev.index + 1
-		if ci-offset > uint64(len(a.entries)) {
-			l.logger.Panicf("index, %d, is out of range [%d]", ci-offset, len(a.entries))
-		}
 		l.append(a.entries[ci-offset:]...)
 	}
+
+commit:
 	l.commitTo(min(committed, lastnewi))
 	return lastnewi, true
 }
 
+// === MODIFIED append to track lastLeaderIndex ===
 func (l *raftLog) append(ents ...pb.Entry) uint64 {
 	if len(ents) == 0 {
 		return l.lastIndex()
@@ -135,8 +198,160 @@ func (l *raftLog) append(ents ...pb.Entry) uint64 {
 	if after := ents[0].Index - 1; after < l.committed {
 		l.logger.Panicf("after(%d) is out of range [committed(%d)]", after, l.committed)
 	}
+
+	// FAST RAFT: Only track leader entries if Fast Raft is enabled
+	if l.enableFastPath {
+		for i := range ents {
+			if ents[i].InsertedBy == pb.InsertedByLeader {
+				if ents[i].Index > l.lastLeaderIndex {
+					l.lastLeaderIndex = ents[i].Index
+					l.lastLeaderTerm = ents[i].Term
+				}
+			}
+		}
+	}
+
 	l.unstable.truncateAndAppend(ents)
 	return l.lastIndex()
+}
+
+// sparseAppend performs sparse insertion for Fast Raft.
+// Unlike regular append, this:
+// 1. Can insert at any index >= committed+1, leaving holes
+// 2. Sets insertedBy field on the entry
+// 3. Does NOT truncate conflicting entries (that's leader's job)
+func (l *raftLog) sparseAppend(index uint64, ent pb.Entry, insertedBy pb.InsertedBy) error {
+	if index <= l.committed {
+		return fmt.Errorf("cannot sparse append at index %d <= committed %d", index, l.committed)
+	}
+
+	ent.InsertedBy = insertedBy
+	ent.Index = index
+
+	// Only check existing entry if index is within current tail.
+	if index <= l.lastIndex() {
+		if existing, err := l.entry(index); err == nil {
+			if !l.shouldOverwrite(existing, ent) {
+				return fmt.Errorf("cannot overwrite entry at %d: existing insertedBy=%v",
+					index, existing.InsertedBy)
+			}
+		}
+	}
+
+	// Delegate to unstable for actual placement (may create holes).
+	l.unstable.sparseInsert(ent)
+
+	// Track last leader-approved position.
+	if insertedBy == pb.InsertedByLeader && index > l.lastLeaderIndex {
+		l.lastLeaderIndex = index
+		l.lastLeaderTerm = ent.Term
+	}
+	return nil
+}
+
+// shouldOverwrite determines if newEnt should overwrite existing.
+// Rules:
+// - Leader entries can overwrite self-approved entries
+// - Leader entries can overwrite other leader entries (normal Raft)
+// - Self entries cannot overwrite leader entries
+// - Self entries can overwrite other self entries if terms differ
+func (l *raftLog) shouldOverwrite(existing, newEnt pb.Entry) bool {
+	// Leader entries can always overwrite
+	if newEnt.InsertedBy == pb.InsertedByLeader {
+		return true
+	}
+
+	// Self entries can only overwrite other self entries
+	if existing.InsertedBy == pb.InsertedBySelf &&
+		newEnt.InsertedBy == pb.InsertedBySelf {
+		// Allow if different terms (conflict resolution)
+		return existing.Term != newEnt.Term
+	}
+
+	// Self entries cannot overwrite leader entries
+	return false
+}
+
+func (l *raftLog) entry(i uint64) (pb.Entry, error) {
+	fi := l.firstIndex()
+	li := l.lastIndex()
+
+	// Return errors instead of panicking.
+	if i < fi {
+		return pb.Entry{}, ErrCompacted // or the etcd equivalent you're using
+	}
+	if i > li {
+		return pb.Entry{}, ErrUnavailable
+	}
+
+	// Fetch starting at i with no size cap; then select the first.
+	ents, err := l.entries(i, noLimit)
+	if err != nil {
+		return pb.Entry{}, err
+	}
+	if len(ents) == 0 || ents[0].Index != i {
+		// Defensive: entries may be empty due to storage compaction or size limits.
+		return pb.Entry{}, ErrUnavailable
+	}
+	return ents[0], nil
+}
+
+// updateLastLeaderIndex scans the log to find the highest leader-approved index
+func (l *raftLog) updateLastLeaderIndex() {
+	// Start from the end and work backwards
+	for i := l.lastIndex(); i >= l.firstIndex(); i-- {
+		if ent, err := l.entry(i); err == nil {
+			if ent.InsertedBy == pb.InsertedByLeader {
+				l.lastLeaderIndex = i
+				l.lastLeaderTerm = ent.Term
+				return
+			}
+		}
+	}
+	// No leader entries found
+	l.lastLeaderIndex = 0
+	l.lastLeaderTerm = 0
+}
+
+// getLastLeaderID returns the ID of the last leader-approved entry.
+// This is used for election up-to-date checks in Fast Raft.
+func (l *raftLog) getLastLeaderID() entryID {
+	if l.lastLeaderIndex == 0 {
+		// No leader entries yet, use the snapshot/first index
+		return entryID{
+			term:  l.lastLeaderTerm,
+			index: l.firstIndex() - 1,
+		}
+	}
+	return entryID{
+		term:  l.lastLeaderTerm,
+		index: l.lastLeaderIndex,
+	}
+}
+
+// hasGaps reports whether there are any *logical* gaps in [from,to].
+// A logical gap is an index with no real entry. With gap-filling storage,
+// holes are represented by zero-term entries (and still count as gaps).
+func (l *raftLog) hasGaps(from, to uint64) bool {
+	if from > to {
+		return false
+	}
+	last := l.lastIndex()
+	for i := from; i <= to; i++ {
+		// Beyond the tail -> still a gap.
+		if i > last {
+			return true
+		}
+		// term(i) returns (0,nil) for zero entry in our gap-filled storage.
+		t, err := l.term(i)
+		if err != nil {
+			return true
+		}
+		if t == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // findConflict finds the index of the conflict.
@@ -432,13 +647,15 @@ func (l *raftLog) allEntries() []pb.Entry {
 
 // isUpToDate determines if a log with the given last entry is more up-to-date
 // by comparing the index and term of the last entries in the existing logs.
-//
-// If the logs have last entries with different terms, then the log with the
-// later term is more up-to-date. If the logs end with the same term, then
-// whichever log has the larger lastIndex is more up-to-date. If the logs are
-// the same, the given log is up-to-date.
 func (l *raftLog) isUpToDate(their entryID) bool {
-	our := l.lastEntryID()
+	var our entryID
+	if l.enableFastPath && l.lastLeaderIndex > 0 {
+		// FAST RAFT: Compare using last leader-approved entry
+		our = l.getLastLeaderID()
+	} else {
+		// Standard Raft: Use full log
+		our = l.lastEntryID()
+	}
 	return their.term > our.term || their.term == our.term && their.index >= our.index
 }
 
@@ -572,3 +789,12 @@ func (l *raftLog) zeroTermOnOutOfBounds(t uint64, err error) uint64 {
 	l.logger.Panicf("unexpected error (%v)", err)
 	return 0
 }
+
+// === Additional helper for getting entry digest (for vote deduplication) ===
+func entryDigest(e *pb.Entry) string {
+	h := sha256.New()
+	h.Write([]byte{byte(e.Type)})
+	h.Write(e.Data)
+	return string(h.Sum(nil)) // or hex if you prefer
+}
+

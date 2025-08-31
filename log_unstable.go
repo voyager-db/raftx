@@ -47,6 +47,36 @@ type unstable struct {
 	offsetInProgress uint64
 
 	logger Logger
+
+	// === FAST RAFT ADDITIONS ===
+	// sparseEntries holds entries that don't fit contiguously in entries slice
+	// This allows gaps in the log for Fast Raft's sparse insertion
+	sparseEntries map[uint64]*pb.Entry
+}
+
+// === NEW METHOD FOR FAST RAFT ===
+// sparseInsert adds an entry at a specific index, growing the slice and
+// filling holes as needed. It never panics on gaps.
+func (u *unstable) sparseInsert(e pb.Entry) {
+	// Ignore entries that are older than our current window (compacted away).
+	if e.Index < u.offset {
+		return
+	}
+
+	pos := int(e.Index - u.offset)
+	switch {
+	case pos == len(u.entries):
+		// append contiguously
+		u.entries = append(u.entries, e)
+	case pos < len(u.entries):
+		// overwrite within existing range
+		u.entries[pos] = e
+	default:
+		// grow and fill holes with zero Entries
+		gap := pos - len(u.entries)
+		u.entries = append(u.entries, make([]pb.Entry, gap)...)
+		u.entries = append(u.entries, e)
+	}
 }
 
 // maybeFirstIndex returns the index of the first possible entry in entries
@@ -58,20 +88,46 @@ func (u *unstable) maybeFirstIndex() (uint64, bool) {
 	return 0, false
 }
 
-// maybeLastIndex returns the last index if it has at least one
-// unstable entry or snapshot.
+// === MODIFIED maybeLastIndex - consider sparse entries ===
 func (u *unstable) maybeLastIndex() (uint64, bool) {
-	if l := len(u.entries); l != 0 {
-		return u.offset + uint64(l) - 1, true
+	// Find max from sparse entries
+	var maxSparse uint64
+	haveSparse := false
+	if u.sparseEntries != nil {
+		for idx := range u.sparseEntries {
+			if !haveSparse || idx > maxSparse {
+				maxSparse = idx
+				haveSparse = true
+			}
+		}
 	}
+
+	// Check regular entries
+	if l := len(u.entries); l != 0 {
+		regularLast := u.offset + uint64(l) - 1
+		if haveSparse && maxSparse > regularLast {
+			return maxSparse, true
+		}
+		return regularLast, true
+	}
+
+	// Check snapshot
 	if u.snapshot != nil {
+		if haveSparse && maxSparse > u.snapshot.Metadata.Index {
+			return maxSparse, true
+		}
 		return u.snapshot.Metadata.Index, true
 	}
+
+	// Only sparse entries
+	if haveSparse {
+		return maxSparse, true
+	}
+
 	return 0, false
 }
 
-// maybeTerm returns the term of the entry at index i, if there
-// is any.
+// === MODIFIED maybeTerm - add sparse entry check ===
 func (u *unstable) maybeTerm(i uint64) (uint64, bool) {
 	if i < u.offset {
 		if u.snapshot != nil && u.snapshot.Metadata.Index == i {
@@ -88,7 +144,19 @@ func (u *unstable) maybeTerm(i uint64) (uint64, bool) {
 		return 0, false
 	}
 
-	return u.entries[i-u.offset].Term, true
+	// Check regular entries first
+	if i < u.offset+uint64(len(u.entries)) {
+		return u.entries[i-u.offset].Term, true
+	}
+
+	// FAST RAFT: Check sparse entries
+	if u.sparseEntries != nil {
+		if e, ok := u.sparseEntries[i]; ok {
+			return e.Term, true
+		}
+	}
+
+	return 0, false
 }
 
 // nextEntries returns the unstable entries that are not already in the process
@@ -125,12 +193,7 @@ func (u *unstable) acceptInProgress() {
 	}
 }
 
-// stableTo marks entries up to the entry with the specified (index, term) as
-// being successfully written to stable storage.
-//
-// The method should only be called when the caller can attest that the entries
-// can not be overwritten by an in-progress log append. See the related comment
-// in newStorageAppendRespMsg.
+// === MODIFIED stableTo - clean up sparse entries ===
 func (u *unstable) stableTo(id entryID) {
 	gt, ok := u.maybeTerm(id.index)
 	if !ok {
@@ -145,18 +208,31 @@ func (u *unstable) stableTo(id entryID) {
 	}
 	if gt != id.term {
 		// Term mismatch between unstable entry and specified entry. Ignore.
-		// This is possible if part or all of the unstable log was replaced
-		// between that time that a set of entries started to be written to
-		// stable storage and when they finished.
 		u.logger.Infof("entry at (index,term)=(%d,%d) mismatched with "+
 			"entry at (%d,%d) in unstable log; ignoring", id.index, id.term, id.index, gt)
 		return
 	}
-	num := int(id.index + 1 - u.offset)
-	u.entries = u.entries[num:]
-	u.offset = id.index + 1
-	u.offsetInProgress = max(u.offsetInProgress, u.offset)
-	u.shrinkEntriesArray()
+
+	// Original logic for regular entries
+	if id.index < u.offset+uint64(len(u.entries)) {
+		num := int(id.index + 1 - u.offset)
+		u.entries = u.entries[num:]
+		u.offset = id.index + 1
+		u.offsetInProgress = max(u.offsetInProgress, u.offset)
+		u.shrinkEntriesArray()
+	}
+
+	// FAST RAFT: Clean up stable sparse entries
+	if u.sparseEntries != nil {
+		for idx := range u.sparseEntries {
+			if idx <= id.index {
+				delete(u.sparseEntries, idx)
+			}
+		}
+		if len(u.sparseEntries) == 0 {
+			u.sparseEntries = nil
+		}
+	}
 }
 
 // shrinkEntriesArray discards the underlying array used by the entries slice
@@ -217,29 +293,83 @@ func (u *unstable) truncateAndAppend(ents []pb.Entry) {
 	}
 }
 
-// slice returns the entries from the unstable log with indexes in the range
-// [lo, hi). The entire range must be stored in the unstable log or the method
-// will panic. The returned slice can be appended to, but the entries in it must
-// not be changed because they are still shared with unstable.
-//
-// TODO(pavelkalinnikov): this, and similar []pb.Entry slices, may bubble up all
-// the way to the application code through Ready struct. Protect other slices
-// similarly, and document how the client can use them.
+// === MODIFIED slice - include sparse entries ===
 func (u *unstable) slice(lo uint64, hi uint64) []pb.Entry {
 	u.mustCheckOutOfBounds(lo, hi)
-	// NB: use the full slice expression to limit what the caller can do with the
-	// returned slice. For example, an append will reallocate and copy this slice
-	// instead of corrupting the neighbouring u.entries.
-	return u.entries[lo-u.offset : hi-u.offset : hi-u.offset]
+
+	// Start with regular entries
+	result := u.entries[lo-u.offset : hi-u.offset : hi-u.offset]
+
+	// FAST RAFT: Check if we need to overlay sparse entries
+	if u.sparseEntries != nil {
+		// We need to create a new slice if there are sparse entries in range
+		var hasSparseInRange bool
+		for idx := range u.sparseEntries {
+			if idx >= lo && idx < hi {
+				hasSparseInRange = true
+				break
+			}
+		}
+
+		if hasSparseInRange {
+			// Create new slice with sparse entries overlaid
+			newResult := make([]pb.Entry, len(result))
+			copy(newResult, result)
+
+			for idx, entry := range u.sparseEntries {
+				if idx >= lo && idx < hi {
+					newResult[idx-lo] = *entry
+				}
+			}
+			return newResult
+		}
+	}
+
+	return result
 }
 
-// u.offset <= lo <= hi <= u.offset+len(u.entries)
+// === MODIFIED mustCheckOutOfBounds - allow sparse entries beyond regular range ===
 func (u *unstable) mustCheckOutOfBounds(lo, hi uint64) {
 	if lo > hi {
 		u.logger.Panicf("invalid unstable.slice %d > %d", lo, hi)
 	}
+
+	// FAST RAFT: Check both regular and sparse bounds
 	upper := u.offset + uint64(len(u.entries))
+
+	// Also check sparse entries for upper bound
+	if u.sparseEntries != nil {
+		for idx := range u.sparseEntries {
+			if idx >= upper {
+				upper = idx + 1
+			}
+		}
+	}
+
 	if lo < u.offset || hi > upper {
 		u.logger.Panicf("unstable.slice[%d,%d) out of bound [%d,%d]", lo, hi, u.offset, upper)
+	}
+}
+
+// === NEW METHOD - attempt to compact sparse entries into regular entries ===
+func (u *unstable) compactSparse() {
+	if u.sparseEntries == nil || len(u.sparseEntries) == 0 {
+		return
+	}
+
+	// Try to extend entries with any contiguous sparse entries
+	nextIdx := u.offset + uint64(len(u.entries))
+	for {
+		if e, ok := u.sparseEntries[nextIdx]; ok {
+			u.entries = append(u.entries, *e)
+			delete(u.sparseEntries, nextIdx)
+			nextIdx++
+		} else {
+			break
+		}
+	}
+
+	if len(u.sparseEntries) == 0 {
+		u.sparseEntries = nil
 	}
 }

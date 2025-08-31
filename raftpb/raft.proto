@@ -12,6 +12,12 @@ option (gogoproto.goproto_unkeyed_all) = false;
 option (gogoproto.goproto_unrecognized_all) = false;
 option (gogoproto.goproto_sizecache_all) = false;
 
+enum InsertedBy {
+	InsertedByUnknown = 0;
+	InsertedBySelf    = 1;
+	InsertedByLeader  = 2;
+}
+
 enum EntryType {
 	EntryNormal       = 0;
 	EntryConfChange   = 1; // corresponds to pb.ConfChange
@@ -23,6 +29,8 @@ message Entry {
 	optional uint64     Index = 3 [(gogoproto.nullable) = false]; // must be 64-bit aligned for atomic operations
 	optional EntryType  Type  = 1 [(gogoproto.nullable) = false];
 	optional bytes      Data  = 4;
+
+	optional InsertedBy inserted_by = 5 [(gogoproto.nullable) = false];
 }
 
 message SnapshotMetadata {
@@ -34,6 +42,20 @@ message SnapshotMetadata {
 message Snapshot {
 	optional bytes            data     = 1;
 	optional SnapshotMetadata metadata = 2 [(gogoproto.nullable) = false];
+}
+
+// ============= NEW MESSAGES FOR FAST RAFT =============
+message FastVote {
+	optional uint64 index        = 1 [(gogoproto.nullable) = false];
+	optional uint64 term         = 2 [(gogoproto.nullable) = false];
+	optional bytes  entry_digest = 3; // Hash of Entry{Type,Data} for dedup
+}
+
+message SelfApprovedHint {
+	optional uint64 index        = 1 [(gogoproto.nullable) = false];
+	optional uint64 term         = 2 [(gogoproto.nullable) = false];
+	optional bytes  entry_digest = 3;
+	optional bool   committed    = 4 [(gogoproto.nullable) = false]; // future-proofing
 }
 
 // For description of different message types, see:
@@ -66,6 +88,11 @@ enum MessageType {
 	// NOTE: when adding new message types, remember to update the isLocalMsg and
 	// isResponseMsg arrays in raft/util.go and update the corresponding tests in
 	// raft/util_test.go.
+	
+	// NEW TYPES for Fast Raft
+	MsgFastProp          = 24;  // Proposer → All: direct proposal broadcast
+	MsgFastVote          = 25;  // Follower → Leader: vote for (index, entry)
+	// Optional: MsgFastRecover = 26; // Or reuse MsgVoteResp with hints field
 }
 
 message Message {
@@ -105,6 +132,10 @@ message Message {
 	// to respond and who to respond to when the work associated with a message
 	// is complete. Populated for MsgStorageAppend and MsgStorageApply messages.
 	repeated Message     responses   = 14 [(gogoproto.nullable) = false];
+
+	// NEW FIELDS for Fast Raft
+	repeated FastVote         fast_votes = 15 [(gogoproto.nullable) = false]; // For MsgFastVote
+	repeated SelfApprovedHint hints      = 16 [(gogoproto.nullable) = false]; // For recovery in MsgVoteResp
 }
 
 message HardState {

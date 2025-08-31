@@ -20,7 +20,7 @@ import (
 	"strings"
 )
 
-// Progress represents a follower’s progress in the view of the leader. Leader
+// Progress represents a follower's progress in the view of the leader. Leader
 // maintains progresses of all followers, and sends entries to the follower
 // based on its progress.
 //
@@ -39,6 +39,11 @@ type Progress struct {
 	//
 	// In StateSnapshot, Next == PendingSnapshot + 1.
 	Next uint64
+
+	// FAST RAFT ADDITION: FastMatchIndex is the highest index where this follower
+	// voted for the same entry that the leader chose. This is used to track
+	// fast quorum progress. Reset to 0 on leader changes.
+	FastMatchIndex uint64
 
 	// sentCommit is the highest commit index in flight to the follower.
 	//
@@ -125,6 +130,21 @@ func (pr *Progress) ResetState(state StateType) {
 	pr.Inflights.reset()
 }
 
+// FAST RAFT: UpdateFastMatch updates the FastMatch index if the follower voted for
+// the leader's chosen entry at the given index.
+func (pr *Progress) UpdateFastMatch(index uint64) {
+	if index > pr.FastMatchIndex {
+		pr.FastMatchIndex = index
+		// FastMatch CAN exceed Match in Fast Raft
+		// A node can vote for an entry before it's replicated
+	}
+}
+
+// FAST RAFT: ResetFastMatch resets the fast match index, typically when a new leader is elected.
+func (pr *Progress) ResetFastMatch() {
+	pr.FastMatchIndex = 0
+}
+
 // BecomeProbe transitions into StateProbe. Next is reset to Match+1 or,
 // optionally and if larger, the index of the pending snapshot.
 func (pr *Progress) BecomeProbe() {
@@ -209,6 +229,10 @@ func (pr *Progress) MaybeUpdate(n uint64) bool {
 	pr.Match = n
 	pr.Next = max(pr.Next, n+1) // invariant: Match < Next
 	pr.MsgAppFlowPaused = false
+	// FAST RAFT: No need to constrain FastMatch here
+	// FastMatch can be > Match (node voted but hasn't replicated yet)
+	// FastMatch can be < Match (node replicated but didn't vote via fast path)
+	// They track different things and can diverge
 	return true
 }
 
@@ -275,6 +299,10 @@ func (pr *Progress) IsPaused() bool {
 func (pr *Progress) String() string {
 	var buf strings.Builder
 	fmt.Fprintf(&buf, "%s match=%d next=%d", pr.State, pr.Match, pr.Next)
+	// FAST RAFT: Include fast match in string representation
+	if pr.FastMatchIndex > 0 {
+		fmt.Fprintf(&buf, " fastMatch=%d", pr.FastMatchIndex)
+	}
 	if pr.IsLearner {
 		fmt.Fprint(&buf, " learner")
 	}

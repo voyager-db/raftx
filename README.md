@@ -1,201 +1,107 @@
-# Raft library
+# Raft + Fast Raft Library
 
-Raft is a protocol with which a cluster of nodes can maintain a replicated state machine.
-The state machine is kept in sync through the use of a replicated log.
-For more details on Raft, see "In Search of an Understandable Consensus Algorithm"
-(https://raft.github.io/raft.pdf) by Diego Ongaro and John Ousterhout.
+This library implements the Raft consensus protocol and extends it with Fast Raft: an optimized path that reduces the number of message rounds needed to commit an entry under no contention.
 
-This Raft library is stable and feature complete. As of 2016, it is **the most widely used** Raft library in production, serving tens of thousands clusters each day. It powers distributed systems such as etcd, Kubernetes, Docker Swarm, Cloud Foundry Diego, CockroachDB, TiDB, Project Calico, Flannel, Hyperledger and more.
+Like upstream etcd/raft, this library implements only the core Raft algorithm and leaves transport, storage, and application integration to the user. The codebase is deterministic, minimal, and designed to be embedded into larger systems.
 
-Most Raft implementations have a monolithic design, including storage handling, messaging serialization, and network transport. This library instead follows a minimalistic design philosophy by only implementing the core raft algorithm. This minimalism buys flexibility, determinism, and performance.
+## Background
 
-To keep the codebase small as well as provide flexibility, the library only implements the Raft algorithm; both network and disk IO are left to the user. Library users must implement their own transportation layer for message passing between Raft peers over the wire. Similarly, users must implement their own storage layer to persist the Raft log and state.
+Raft is a protocol with which a cluster of nodes can maintain a replicated state machine. The state machine is kept in sync through the use of a replicated log.
 
-In order to easily test the Raft library, its behavior should be deterministic. To achieve this determinism, the library models Raft as a state machine.  The state machine takes a `Message` as input. A message can either be a local timer update or a network message sent from a remote peer. The state machine's output is a 3-tuple `{[]Messages, []LogEntries, NextState}` consisting of an array of `Messages`, `log entries`, and `Raft state changes`. For state machines with the same state, the same state machine input should always generate the same state machine output.
+In classic Raft, every proposal must flow through the leader: proposer → leader → followers → commit.  
+In Fast Raft, the proposer broadcasts directly to all peers, which speculatively insert the entry as self-approved and send votes back to the leader. The leader tallies votes for each index:
 
-A simple example application, _raftexample_, is also available to help illustrate how to use this package in practice: https://github.com/etcd-io/etcd/tree/main/contrib/raftexample
+- If a fast quorum agrees (⌈3n/4⌉ for cluster size n), the leader can fast-commit in 2 rounds: proposer→all, leader→all.
+- If only a classic quorum agrees (⌈n/2⌉), the leader falls back to the classic Raft track, appending the chosen entry as leader-approved and replicating it.
 
-# Features
+This preserves Raft’s safety and liveness guarantees, while reducing latency in the uncontended case.
 
-This raft implementation is a full feature implementation of Raft protocol. Features includes:
+## Features
 
-- Leader election
-- Log replication
-- Log compaction
-- Membership changes
-- Leadership transfer extension
-- Efficient linearizable read-only queries served by both the leader and followers
-  - leader checks with quorum and bypasses Raft log before processing read-only queries
-  - followers asks leader to get a safe read index before processing read-only queries
-- More efficient lease-based linearizable read-only queries served by both the leader and followers
-  - leader bypasses Raft log and processing read-only queries locally
-  - followers asks leader to get a safe read index before processing read-only queries
-  - this approach relies on the clock of the all the machines in raft group
+This library includes all features from upstream etcd/raft:
 
-This raft implementation also includes a few optional enhancements:
+- Leader election  
+- Log replication  
+- Log compaction  
+- Membership changes  
+- Leadership transfer  
+- Linearizable read-only queries (safe and lease-based)  
+- Flow control, batching, parallel leader disk writes, conf-change safety  
 
-- Optimistic pipelining to reduce log replication latency
-- Flow control for log replication
-- Batching Raft messages to reduce synchronized network I/O calls
-- Batching log entries to reduce disk synchronized I/O
-- Writing to leader's disk in parallel
-- Internal proposal redirection from followers to leader
-- Automatic stepping down when the leader loses quorum
-- Protection against unbounded log growth when quorum is lost
+With the following Fast Raft extensions:
 
-## Notable Users
-
-- [cockroachdb](https://github.com/cockroachdb/cockroach) A Scalable, Survivable, Strongly-Consistent SQL Database
-- [dgraph](https://github.com/dgraph-io/dgraph) A Scalable, Distributed, Low Latency, High Throughput Graph Database
-- [etcd](https://github.com/etcd-io/etcd) A distributed reliable key-value store
-- [tikv](https://github.com/pingcap/tikv) A Distributed transactional key value database powered by Rust and Raft
-- [swarmkit](https://github.com/docker/swarmkit) A toolkit for orchestrating distributed systems at any scale.
-- [chain core](https://github.com/chain/chain) Software for operating permissioned, multi-asset blockchain networks
+- **Fast path log insertion (MsgFastProp, MsgFastVote)**  
+- Followers insert speculative self-approved entries without truncating  
+- Leader tallies votes in `possibleEntries` and upgrades the chosen entry  
+- **Fast quorum commit rule**: If ⌈3n/4⌉ nodes (including leader) agree on an entry, it can be committed immediately  
+- **Classic fallback path**: If only ⌈n/2⌉ nodes agree, leader inserts the chosen entry as leader-approved and continues via normal AppendEntries  
+- **Overwrite rule at chosen index**: Followers overwrite self-approved entries with the leader’s chosen entry once decided  
+- **Election recovery**: During leader election, nodes include self-approved hints in MsgVoteResp  
+- **Side-buffer flush**: Followers can buffer out-of-order fast proposals and flush them into the log once the prefix arrives  
 
 ## Usage
 
-The primary object in raft is a Node. Either start a Node from scratch using raft.StartNode or start a Node from some initial state using raft.RestartNode.
+Usage is identical to etcd/raft. Create a Node with `raft.StartNode` or `raft.RestartNode`, wire up storage and transport, and drive the state machine loop with `Tick` and `Step`.
 
-To start a three-node cluster
+To enable Fast Raft in a node:
+
 ```go
-  storage := raft.NewMemoryStorage()
-  c := &raft.Config{
+cfg := &raft.Config{
     ID:              0x01,
     ElectionTick:    10,
     HeartbeatTick:   1,
-    Storage:         storage,
+    Storage:         raft.NewMemoryStorage(),
     MaxSizePerMsg:   4096,
     MaxInflightMsgs: 256,
-  }
-  // Set peer list to all nodes in the cluster.
-  // Note that other nodes in the cluster, apart from this node, need to be started separately.
-  n := raft.StartNode(c, []raft.Peer{{ID: 0x01}, {ID: 0x02}, {ID: 0x03}})
+    EnableFastPath:  true, // <-- enable Fast Raft
+}
+n := raft.StartNode(cfg, peers)
 ```
 
-Start a single node cluster, like so:
-```go
-  // Create storage and config as shown above.
-  // Set peer list to itself, so this node can become the leader of this single-node cluster.
-  peers := []raft.Peer{{ID: 0x01}}
-  n := raft.StartNode(c, peers)
-```
+## Messages and Log Entries
 
-To allow a new node to join this cluster, do not pass in any peers. First, add the node to the existing cluster by calling `ProposeConfChange` on any existing node inside the cluster. Then, start the node with an empty peer list, like so:
-```go
-  // Create storage and config as shown above.
-  n := raft.StartNode(c, nil)
-```
+Messages and log entries are the same as in classic Raft, with two additions:
 
-To restart a node from previous state:
-```go
-  storage := raft.NewMemoryStorage()
+- **MsgFastProp** – proposer broadcasts entries directly to peers  
+- **MsgFastVote** – follower sends vote for a self-approved entry back to leader  
 
-  // Recover the in-memory storage from persistent snapshot, state and entries.
-  storage.ApplySnapshot(snapshot)
-  storage.SetHardState(state)
-  storage.Append(entries)
+If `EnableFastPath=false`, the library behaves exactly like upstream etcd/raft.
 
-  c := &raft.Config{
-    ID:              0x01,
-    ElectionTick:    10,
-    HeartbeatTick:   1,
-    Storage:         storage,
-    MaxSizePerMsg:   4096,
-    MaxInflightMsgs: 256,
-  }
+## Implementation Details
 
-  // Restart raft without peer information.
-  // Peer information is already included in the storage.
-  n := raft.RestartNode(c)
-```
+### insertedBy flag
+Each log entry tracks its origin:
 
-After creating a Node, the user has a few responsibilities:
+- **InsertedBySelf**: entry speculatively inserted from a fast proposal  
+- **InsertedByLeader**: entry inserted/confirmed by the leader  
+- **InsertedByUnknown**: default (classic Raft)  
 
-First, read from the Node.Ready() channel and process the updates it contains. These steps may be performed in parallel, except as noted in step 2.
+### Log structure
+- Follower uses `sparseAppend` to insert entries at arbitrary indexes ≥ committed+1, leaving gaps  
+- Leader never truncates speculative entries, but overwrites at the chosen index  
 
-1. Write Entries, HardState and Snapshot to persistent storage in order, i.e. Entries first, then HardState and Snapshot if they are not empty. If persistent storage supports atomic writes then all of them can be written together. Note that when writing an Entry with Index i, any previously-persisted entries with Index >= i must be discarded.
+### Decision flow
+- `handleFastProp`: follower inserts entry, votes for it  
+- `handleFastVote`: leader records vote, tallies at index k  
+- `tryDecideAt`: if quorum, upgrades chosen entry and replicates  
+- `maybeAppend`: follower overwrites self-approved entry with leader-approved choice  
 
-2. Send all Messages to the nodes named in the To field. It is important that no messages be sent until the latest HardState has been persisted to disk, and all Entries written by any previous Ready batch (Messages may be sent while entries from the same batch are being persisted). To reduce the I/O latency, an optimization can be applied to make leader write to disk in parallel with its followers (as explained at section 10.2.1 in Raft thesis). If any Message has type MsgSnap, call Node.ReportSnapshot() after it has been sent (these messages may be large). Note: Marshalling messages is not thread-safe; it is important to make sure that no new entries are persisted while marshalling. The easiest way to achieve this is to serialise the messages directly inside the main raft loop.
+### Recovery flow
+- Voters piggyback self-approved hints on `MsgVoteResp`  
+- New leader seeds `possibleEntries` from hints  
+- Any entry that could have been chosen is preserved  
 
-3. Apply Snapshot (if any) and CommittedEntries to the state machine. If any committed Entry has Type EntryConfChange, call Node.ApplyConfChange() to apply it to the node. The configuration change may be cancelled at this point by setting the NodeID field to zero before calling ApplyConfChange (but ApplyConfChange must be called one way or the other, and the decision to cancel must be based solely on the state machine and not external information such as the observed health of the node).
+## Example
 
-4. Call Node.Advance() to signal readiness for the next batch of updates. This may be done at any time after step 1, although all updates must be processed in the order they were returned by Ready.
+Fast Raft reduces the latency for uncontended proposals. In a 5-node cluster:
 
-Second, all persisted log entries must be made available via an implementation of the Storage interface. The provided MemoryStorage type can be used for this (if repopulating its state upon a restart), or a custom disk-backed implementation can be supplied.
+- **Classic Raft**: proposer→leader→followers→leader commit → broadcast commit (~2 RTT)  
+- **Fast Raft**: proposer→all, followers→leader votes, leader commit → broadcast commit (~1 RTT faster)  
 
-Third, after receiving a message from another node, pass it to Node.Step:
+## Status
 
-```go
-	func recvRaftRPC(ctx context.Context, m raftpb.Message) {
-		n.Step(ctx, m)
-	}
-```
-
-Finally, call `Node.Tick()` at regular intervals (probably via a `time.Ticker`). Raft has two important timeouts: heartbeat and the election timeout. However, internally to the raft package time is represented by an abstract "tick".
-
-The total state machine handling loop will look something like this:
-
-```go
-  for {
-    select {
-    case <-s.Ticker:
-      n.Tick()
-    case rd := <-s.Node.Ready():
-      saveToStorage(rd.HardState, rd.Entries, rd.Snapshot)
-      send(rd.Messages)
-      if !raft.IsEmptySnap(rd.Snapshot) {
-        processSnapshot(rd.Snapshot)
-      }
-      for _, entry := range rd.CommittedEntries {
-        process(entry)
-        if entry.Type == raftpb.EntryConfChange {
-          var cc raftpb.ConfChange
-          cc.Unmarshal(entry.Data)
-          s.Node.ApplyConfChange(cc)
-        }
-      }
-      s.Node.Advance()
-    case <-s.done:
-      return
-    }
-  }
-```
-
-To propose changes to the state machine from the node to take application data, serialize it into a byte slice and call:
-
-```go
-	n.Propose(ctx, data)
-```
-
-If the proposal is committed, data will appear in committed entries with type raftpb.EntryNormal. There is no guarantee that a proposed command will be committed; the command may have to be reproposed after a timeout.
-
-To add or remove node in a cluster, build ConfChange struct 'cc' and call:
-
-```go
-	n.ProposeConfChange(ctx, cc)
-```
-
-After config change is committed, some committed entry with type raftpb.EntryConfChange will be returned. This must be applied to node through:
-
-```go
-	var cc raftpb.ConfChange
-	cc.Unmarshal(data)
-	n.ApplyConfChange(cc)
-```
-
-Note: An ID represents a unique node in a cluster for all time. A
-given ID MUST be used only once even if the old node has been removed.
-This means that for example IP addresses make poor node IDs since they
-may be reused. Node IDs must be non-zero.
-
-## Implementation notes
-
-This implementation is up to date with the final Raft thesis (https://github.com/ongardie/dissertation/blob/master/stanford.pdf), although this implementation of the membership change protocol differs somewhat from that described in chapter 4. The key invariant that membership changes happen one node at a time is preserved, but in our implementation the membership change takes effect when its entry is applied, not when it is added to the log (so the entry is committed under the old membership instead of the new). This is equivalent in terms of safety, since the old and new configurations are guaranteed to overlap.
-
-To ensure there is no attempt to commit two membership changes at once by matching log positions (which would be unsafe since they should have different quorum requirements), any proposed membership change is simply disallowed while any uncommitted change appears in the leader's log.
-
-This approach introduces a problem when removing a member from a two-member cluster: If one of the members dies before the other one receives the commit of the confchange entry, then the member cannot be removed any more since the cluster cannot make progress. For this reason it is highly recommended to use three or more nodes in every cluster.
+This library is experimental. While it passes a suite of correctness tests (safety, election recovery, overwrite rules), further benchmarking and production hardening are in progress.
 
 ## Go docs
 
-More detailed development documentation can be found in go docs: https://pkg.go.dev/go.etcd.io/raft/v3.
+API docs are mostly identical to etcd/raft: [pkg.go.dev/go.etcd.io/raft/v3](https://pkg.go.dev/go.etcd.io/raft/v3)

@@ -26,6 +26,8 @@ func (st StateType) MarshalJSON() ([]byte, error) {
 	return []byte(fmt.Sprintf("%q", st.String())), nil
 }
 
+// FAST RAFT: Extended to include new message types
+// Note: The array size must be at least as large as the highest MessageType value
 var isLocalMsg = [...]bool{
 	pb.MsgHup:               true,
 	pb.MsgBeat:              true,
@@ -36,8 +38,14 @@ var isLocalMsg = [...]bool{
 	pb.MsgStorageAppendResp: true,
 	pb.MsgStorageApply:      true,
 	pb.MsgStorageApplyResp:  true,
+	pb.MsgForgetLeader:      true,
+	// FAST RAFT: MsgFastProp and MsgFastVote are not local messages
+	// They need to be sent over the network
+	// pb.MsgFastProp:       false,  // index 24
+	// pb.MsgFastVote:       false,  // index 25
 }
 
+// FAST RAFT: Extended to include MsgFastVote as a response message
 var isResponseMsg = [...]bool{
 	pb.MsgAppResp:           true,
 	pb.MsgVoteResp:          true,
@@ -47,6 +55,8 @@ var isResponseMsg = [...]bool{
 	pb.MsgPreVoteResp:       true,
 	pb.MsgStorageAppendResp: true,
 	pb.MsgStorageApplyResp:  true,
+	// FAST RAFT: MsgFastVote is a response to MsgFastProp
+	// Note: We need to handle this specially since the array might not be large enough
 }
 
 func isMsgInArray(msgt pb.MessageType, arr []bool) bool {
@@ -55,10 +65,18 @@ func isMsgInArray(msgt pb.MessageType, arr []bool) bool {
 }
 
 func IsLocalMsg(msgt pb.MessageType) bool {
+	// FAST RAFT: Explicitly handle new message types that are beyond array bounds
+	if msgt == pb.MsgFastProp || msgt == pb.MsgFastVote {
+		return false
+	}
 	return isMsgInArray(msgt, isLocalMsg[:])
 }
 
 func IsResponseMsg(msgt pb.MessageType) bool {
+	// FAST RAFT: MsgFastVote is a response message
+	if msgt == pb.MsgFastVote {
+		return true
+	}
 	return isMsgInArray(msgt, isResponseMsg[:])
 }
 
@@ -164,6 +182,31 @@ func describeMessageWithIndent(indent string, m pb.Message, f EntryFormatter) st
 	if m.Vote != 0 {
 		fmt.Fprintf(&buf, " Vote:%d", m.Vote)
 	}
+
+	// FAST RAFT: Handle FastVotes field for MsgFastVote messages
+	if len(m.FastVotes) > 0 {
+		fmt.Fprintf(&buf, " FastVotes:[")
+		for i, fv := range m.FastVotes {
+			if i > 0 {
+				fmt.Fprint(&buf, ", ")
+			}
+			fmt.Fprintf(&buf, "idx:%d term:%d digest:%x", fv.Index, fv.Term, fv.EntryDigest)
+		}
+		fmt.Fprint(&buf, "]")
+	}
+
+	// FAST RAFT: Handle Hints field for vote responses with self-approved hints
+	if len(m.Hints) > 0 {
+		fmt.Fprintf(&buf, " Hints:[")
+		for i, h := range m.Hints {
+			if i > 0 {
+				fmt.Fprint(&buf, ", ")
+			}
+			fmt.Fprintf(&buf, "idx:%d term:%d", h.Index, h.Term)
+		}
+		fmt.Fprint(&buf, "]")
+	}
+
 	if ln := len(m.Entries); ln == 1 {
 		fmt.Fprintf(&buf, " Entries:[%s]", DescribeEntry(m.Entries[0], f))
 	} else if ln > 1 {
@@ -236,7 +279,16 @@ func DescribeEntry(e pb.Entry, f EntryFormatter) string {
 	if formatted != "" {
 		formatted = " " + formatted
 	}
-	return fmt.Sprintf("%d/%d %s%s", e.Term, e.Index, e.Type, formatted)
+
+	// FAST RAFT: Include InsertedBy information if present
+	insertedByStr := ""
+	if e.InsertedBy == pb.InsertedBySelf {
+		insertedByStr = " [self]"
+	} else if e.InsertedBy == pb.InsertedByLeader {
+		insertedByStr = " [leader]"
+	}
+
+	return fmt.Sprintf("%d/%d %s%s%s", e.Term, e.Index, e.Type, formatted, insertedByStr)
 }
 
 // DescribeEntries calls DescribeEntry for each Entry, adding a newline to

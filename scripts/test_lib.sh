@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
-ROOT_MODULE="go.etcd.io/raft"
+ROOT_MODULE="github.com/voyager-db/raftx"
 
 function set_root_dir {
-  RAFT_ROOT_DIR=$(go list -f '{{.Dir}}' "${ROOT_MODULE}/v3")
+  RAFT_ROOT_DIR=$(go list -f '{{.Dir}}' "${ROOT_MODULE}")
 }
 
 set_root_dir

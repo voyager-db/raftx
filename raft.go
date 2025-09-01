@@ -25,10 +25,10 @@ import (
 	"strings"
 	"sync"
 
-	"go.etcd.io/raft/v3/confchange"
-	"go.etcd.io/raft/v3/quorum"
-	pb "go.etcd.io/raft/v3/raftpb"
-	"go.etcd.io/raft/v3/tracker"
+	"github.com/voyager-db/raftx/confchange"
+	"github.com/voyager-db/raftx/quorum"
+	pb "github.com/voyager-db/raftx/raftpb"
+	"github.com/voyager-db/raftx/tracker"
 )
 
 const (
@@ -292,6 +292,22 @@ type Config struct {
 	// committed with a fast quorum (3/4) in the same term.
 	// Default is false for backward compatibility.
 	EnableFastPath bool
+
+	// ====== C-RAFT ======
+	// EnableCRaft turns on the two-level consensus (local + global).
+	EnableCRaft bool
+
+	// ClusterID identifies this node's local cluster (optional but useful if nodes
+	// can belong to multiple clusters). 0 means "unspecified."
+	ClusterID uint64
+
+	// GlobalVoters is the set of cluster-leader IDs that form the global tier.
+	// Only local leaders participate in global consensus.
+	GlobalVoters []uint64
+
+	// Optional: distinct timers for the global tier. If zero, reuse local ticks.
+	GlobalElectionTick  int
+	GlobalHeartbeatTick int
 }
 
 func (c *Config) validate() error {
@@ -339,6 +355,20 @@ func (c *Config) validate() error {
 
 	if c.ReadOnlyOption == ReadOnlyLeaseBased && !c.CheckQuorum {
 		return errors.New("CheckQuorum must be enabled when ReadOnlyOption is ReadOnlyLeaseBased")
+	}
+
+	if c.EnableCRaft {
+		if len(c.GlobalVoters) == 0 {
+			// Not strictly required if you bootstrap via ConfChange later,
+			// but helpful for bring-up.
+			c.Logger.Warningf("EnableCRaft set but GlobalVoters is empty; initialize via global ConfChanges later")
+		}
+		if c.GlobalElectionTick == 0 {
+			c.GlobalElectionTick = c.ElectionTick
+		}
+		if c.GlobalHeartbeatTick == 0 {
+			c.GlobalHeartbeatTick = c.HeartbeatTick
+		}
 	}
 
 	return nil
@@ -460,6 +490,48 @@ type raft struct {
 	// fastPropStore remembers proposed entries by (index,digest) so the leader
 	// can materialize the chosen entry when deciding.
 	fastPropStore map[uint64]map[string]pb.Entry // index -> digest -> Entry
+
+	// ====== C-RAFT: global-tier state ======
+	enableCRaft bool
+
+	gTerm  uint64
+	gVote  uint64
+	gLead  uint64
+	gState gStateType
+
+	// Global commit index for the global log.
+	gCommit uint64
+
+	// Global tracker (membership + match/fast-match of cluster leaders).
+	gtrk tracker.ProgressTracker
+
+	// Fast-path tally for global batches: globalIndex -> votes
+	gPossibleBatches map[uint64]*quorum.FastVoteCounter
+
+	// Global log head (indices only; data lives in GlobalBatch)
+	gLastIndex uint64
+
+	// Pending: local global-state entries we injected and must wait to be committed
+	// before we proceed with a global broadcast.
+	pendingGlobalState map[uint64]pb.GlobalBatch // localIndex -> batch
+
+	pendingGlobalAcks map[uint64]pendingGlobalAck
+
+	globalPropStore map[uint64]map[string]*pb.GlobalBatch // gIndex -> digest -> batch
+
+	pendingGlobalApp map[uint64]pb.Message
+
+	// Bookkeeping for batch construction:
+	// last local index included into the global log by this cluster leader.
+	globLastLocalIncluded uint64
+
+	// Global timers
+	gElectionElapsed  int
+	gHeartbeatElapsed int
+	gElectionTimeout  int
+	gHeartbeatTimeout int
+
+	glog *globalLog
 }
 
 func newRaft(c *Config) *raft {
@@ -492,6 +564,7 @@ func newRaft(c *Config) *raft {
 		traceLogger:                 c.TraceLogger,
 
 		enableFastPath:    c.EnableFastPath,
+		enableCRaft:       c.EnableCRaft,
 		possibleEntries:   make(map[uint64]*quorum.FastVoteCounter),
 		selfApprovedHints: nil,
 	}
@@ -500,6 +573,48 @@ func newRaft(c *Config) *raft {
 	if r.enableFastPath {
 		r.trk.EnableFastPath = true
 		raftlog.enableFastRaft()
+	}
+
+	if r.enableCRaft {
+		// Initialize global tracker with voters from config (single config).
+		r.gtrk = tracker.MakeProgressTracker(c.MaxInflightMsgs, c.MaxInflightBytes)
+		if r.enableFastPath {
+			r.gtrk.EnableFastPath = true
+		}
+		// 2) Seed membership (config-provided voters)
+		if len(c.GlobalVoters) > 0 {
+			ids := quorum.MajorityConfig{}
+			for _, id := range c.GlobalVoters {
+				ids[id] = struct{}{}
+				if r.gtrk.Progress[id] == nil {
+					r.gtrk.Progress[id] = &tracker.Progress{
+						Next:         1,
+						Inflights:    tracker.NewInflights(r.gtrk.MaxInflight, r.gtrk.MaxInflightBytes),
+						RecentActive: true,
+					}
+				}
+			}
+			r.gtrk.Config.Voters = quorum.JointConfig{ids, nil}
+		}
+		// Ensure SELF always has a Progress entry (even if GlobalVoters was empty).
+		if r.gtrk.Progress[r.id] == nil {
+			r.gtrk.Progress[r.id] = &tracker.Progress{
+				Next:         1,
+				Inflights:    tracker.NewInflights(r.gtrk.MaxInflight, r.gtrk.MaxInflightBytes),
+				RecentActive: true,
+			}
+		}
+
+		r.gState = gStateFollower
+		r.gTerm, r.gVote, r.gLead, r.gCommit = 0, None, None, 0
+		r.gElectionTimeout = c.GlobalElectionTick
+		r.gHeartbeatTimeout = c.GlobalHeartbeatTick
+		r.gPossibleBatches = make(map[uint64]*quorum.FastVoteCounter)
+		r.pendingGlobalState = make(map[uint64]pb.GlobalBatch)
+		r.pendingGlobalAcks = make(map[uint64]pendingGlobalAck)
+		r.glog = newGlobalLog()
+		r.pendingGlobalApp = make(map[uint64]pb.Message)
+
 	}
 
 	traceInitState(r)
@@ -737,6 +852,17 @@ func (r *raft) handleFastProp(m pb.Message) {
 	if e.Index == last+1 {
 		// Contiguous: append as self-approved.
 		_ = r.raftLog.sparseAppend(e.Index, e, pb.InsertedBySelf)
+
+		if e.IsGlobalState {
+			var gse pb.GlobalStateEntry
+			if err := gse.Unmarshal(e.Data); err == nil && gse.Batch != nil {
+				if r.pendingGlobalState == nil {
+					r.pendingGlobalState = make(map[uint64]pb.GlobalBatch)
+				}
+				r.pendingGlobalState[e.Index] = *gse.Batch
+			}
+		}
+
 		// Optionally fold any now-contiguous buffered entries.
 		for {
 			next := r.raftLog.lastIndex() + 1
@@ -751,6 +877,17 @@ func (r *raft) handleFastProp(m pb.Message) {
 		// Gap: keep in side buffer, do not touch log yet.
 		e.InsertedBy = pb.InsertedBySelf
 		r.pendingSelf[e.Index] = e
+
+		if e.IsGlobalState {
+			var gse pb.GlobalStateEntry
+			if err := gse.Unmarshal(e.Data); err == nil && gse.Batch != nil {
+				if r.pendingGlobalState == nil {
+					r.pendingGlobalState = make(map[uint64]pb.GlobalBatch)
+				}
+				// record under its future local index
+				r.pendingGlobalState[e.Index] = *gse.Batch
+			}
+		}
 	}
 
 	// Send (or process) a fast vote for this proposal.
@@ -873,18 +1010,20 @@ func (r *raft) send(m pb.Message) {
 			r.logger.Panicf("term should be set when sending %s", m.Type)
 		}
 	} else {
-		if m.Term != 0 {
+		if m.Term != 0 && !isGlobalMsg(m.Type) {
 			r.logger.Panicf("term should not be set when sending %s (was %d)", m.Type, m.Term)
 		}
-		// do not attach term to MsgProp, MsgReadIndex
-		// proposals are a way to forward to the leader and
-		// should be treated as local message.
-		// MsgReadIndex is also forwarded to leader.
 		if m.Type != pb.MsgProp && m.Type != pb.MsgReadIndex {
-			m.Term = r.Term
+			if isGlobalMsg(m.Type) {
+				if m.Term == 0 { // <<< only fill if still empty
+					m.Term = r.gTerm
+				}
+			} else {
+				m.Term = r.Term
+			}
 		}
 	}
-	if m.Type == pb.MsgAppResp || m.Type == pb.MsgVoteResp || m.Type == pb.MsgPreVoteResp {
+	if m.Type == pb.MsgAppResp || m.Type == pb.MsgVoteResp || m.Type == pb.MsgPreVoteResp || m.Type == pb.MsgGlobalAppResp || m.Type == pb.MsgGlobalVoteResp || m.Type == pb.MsgGlobalHeartbeatResp {
 		// If async storage writes are enabled, messages added to the msgs slice
 		// are allowed to be sent out before unstable state (e.g. log entry
 		// writes and election votes) have been durably synced to the local
@@ -1107,6 +1246,49 @@ func (r *raft) appliedTo(index uint64, size entryEncodingSize) {
 			r.logger.Infof("initiating automatic transition out of joint configuration %s", r.trk.Config)
 		}
 	}
+
+	if r.enableCRaft {
+		// ✅ 1) Leader-only: fire global fast-prop once local wrapper commits.
+		if r.gState == gStateLeader && len(r.pendingGlobalState) > 0 {
+			for li, batch := range r.pendingGlobalState {
+				if li <= r.raftLog.applied {
+					delete(r.pendingGlobalState, li)
+					r.onGlobalStateEntryCommitted(batch) // broadcasts MsgGlobalFastProp
+				}
+			}
+		}
+
+		// 2) Followers (and leader for self-vote): send deferred fast-votes after wrapper commit.
+		if len(r.pendingGlobalAcks) > 0 {
+			for li, ack := range r.pendingGlobalAcks {
+				if li <= r.raftLog.applied {
+					r.logger.Infof("[G] send FastVote -> gIndex=%d term=%d to=%x (localIdx<=applied=%d)",
+						ack.gIndex, ack.gTerm, ack.to, r.raftLog.applied)
+					m := pb.Message{
+						Type:          pb.MsgGlobalFastVote,
+						To:            ack.to,
+						From:          r.id,
+						GlobalIndex:   ack.gIndex,
+						GlobalLogTerm: ack.gTerm,
+						Context:       []byte(ack.digest),
+					}
+					m.Term = ack.gTerm
+					r.send(m)
+					delete(r.pendingGlobalAcks, li)
+				}
+			}
+		}
+
+		// 3) Resume any deferred classic global appends after wrapper commit.
+		if len(r.pendingGlobalApp) > 0 {
+			for li, msg := range r.pendingGlobalApp {
+				if li <= r.raftLog.applied {
+					_ = r.handleGlobalAppend(msg)
+					delete(r.pendingGlobalApp, li)
+				}
+			}
+		}
+	}
 }
 
 func (r *raft) appliedSnap(snap *pb.Snapshot) {
@@ -1198,6 +1380,7 @@ func (r *raft) tickElection() {
 			r.logger.Debugf("error occurred during election: %v", err)
 		}
 	}
+	r.tickGlobal()
 }
 
 // tickHeartbeat is run by leaders to send a MsgBeat after r.heartbeatTimeout.
@@ -1228,6 +1411,7 @@ func (r *raft) tickHeartbeat() {
 			r.logger.Debugf("error occurred during checking sending heartbeat: %v", err)
 		}
 	}
+	r.tickGlobal()
 }
 
 func (r *raft) becomeFollower(term uint64, lead uint64) {
@@ -1470,6 +1654,14 @@ func (r *raft) poll(id uint64, t pb.MessageType, v bool) (granted int, rejected 
 
 func (r *raft) Step(m pb.Message) error {
 	traceReceiveMessage(r, &m)
+
+	// ---- C-RAFT: route global messages by global term/state BEFORE local term handling ----
+	if isGlobalMsg(m.Type) {
+		if !r.enableCRaft {
+			return nil
+		}
+		return r.stepGlobal(m)
+	}
 
 	// Handle the message term, which may result in our stepping down to a follower.
 	switch {

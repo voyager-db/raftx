@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"strings"
 
-	"go.etcd.io/raft/v3"
+	raft "github.com/voyager-db/raftx"
 )
 
 type logLevels [6]string

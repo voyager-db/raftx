@@ -19,8 +19,8 @@ import (
 	"slices"
 	"strings"
 
-	"go.etcd.io/raft/v3/quorum"
-	pb "go.etcd.io/raft/v3/raftpb"
+	"github.com/voyager-db/raftx/quorum"
+	pb "github.com/voyager-db/raftx/raftpb"
 )
 
 // Config reflects the configuration tracked in a ProgressTracker.

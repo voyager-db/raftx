@@ -31,6 +31,15 @@ message Entry {
 	optional bytes      Data  = 4;
 
 	optional InsertedBy inserted_by = 5 [(gogoproto.nullable) = false];
+
+	// ============= C-RAFT: LOCAL LOG ANNOTATION =============
+	// True when this Entry is a "global state entry" (the reflective local entry
+	// that captures inter-cluster consensus state). Data should contain a
+	// marshaled GlobalStateEntry.
+	optional bool       is_global_state = 6 [(gogoproto.nullable) = false];
+
+	// Optional hint to speed recovery/bookkeeping. Safe to omit in payloads.
+	optional uint64     global_index_hint = 7 [(gogoproto.nullable) = false];
 }
 
 message SnapshotMetadata {
@@ -56,6 +65,37 @@ message SelfApprovedHint {
 	optional uint64 term         = 2 [(gogoproto.nullable) = false];
 	optional bytes  entry_digest = 3;
 	optional bool   committed    = 4 [(gogoproto.nullable) = false]; // future-proofing
+}
+
+// ============= C-RAFT: GLOBAL SCOPE & BATCH TYPES =============
+
+// Scope lets higher layers quickly branch logic, but wire behavior still
+// follows MessageType. Optional; you can omit if you prefer relying solely
+// on MessageType prefixes.
+enum Scope {
+  ScopeLocal  = 0;
+  ScopeGlobal = 1;
+}
+
+// A batch of local entries that a cluster leader proposes to the global log.
+// 'entries' are the *local* entries (EntryNormal/ConfChange* as usual).
+// 'first_index/last_index' describe the *local* contiguous range included.
+// 'digest' allows dedup/fast-vote tallying per-batch at the global tier.
+message GlobalBatch {
+  repeated Entry entries      = 1 [(gogoproto.nullable) = false];
+  optional uint64 first_index = 2 [(gogoproto.nullable) = false];
+  optional uint64 last_index  = 3 [(gogoproto.nullable) = false];
+  optional bytes  digest      = 4; // hash of (indices, terms, entry digests)
+}
+
+// A "global state entry" is *written to the local log* to replicate the
+// cluster leader's global progress so successors can recover it.
+// 'global_index/term' are the coordinates in the *global* log that this
+// state refers to (either proposed or decided, depending on when inserted).
+message GlobalStateEntry {
+  optional GlobalBatch batch        = 1; // batch payload reflected into local log
+  optional uint64      global_index = 2 [(gogoproto.nullable) = false];
+  optional uint64      global_term  = 3 [(gogoproto.nullable) = false];
 }
 
 // For description of different message types, see:
@@ -85,14 +125,24 @@ enum MessageType {
 	MsgStorageApply      = 21;
 	MsgStorageApplyResp  = 22;
 	MsgForgetLeader      = 23;
-	// NOTE: when adding new message types, remember to update the isLocalMsg and
-	// isResponseMsg arrays in raft/util.go and update the corresponding tests in
-	// raft/util_test.go.
 	
 	// NEW TYPES for Fast Raft
 	MsgFastProp          = 24;  // Proposer → All: direct proposal broadcast
 	MsgFastVote          = 25;  // Follower → Leader: vote for (index, entry)
-	// Optional: MsgFastRecover = 26; // Or reuse MsgVoteResp with hints field
+
+	// ============= C-RAFT: GLOBAL MESSAGE TYPES =============
+	MsgGlobalFastProp          = 30; // ClusterLeader → AllClusterLeaders: propose GlobalBatch (fast path)
+	MsgGlobalFastVote          = 31; // ClusterLeader → GlobalLeader: votes on batch/digest
+	MsgGlobalApp               = 32; // Global leader AppendEntries for the global log
+	MsgGlobalAppResp           = 33;
+	MsgGlobalHeartbeat         = 34;
+	MsgGlobalHeartbeatResp     = 35;
+	MsgGlobalReadIndex         = 36; // optional parity with ReadIndex at global tier
+	MsgGlobalReadIndexResp     = 37;
+	MsgGlobalTimeoutNow        = 38; // ask a cluster leader to start a global election
+	MsgGlobalVote              = 39; 
+  	MsgGlobalVoteResp          = 40; 
+
 }
 
 message Message {
@@ -133,9 +183,32 @@ message Message {
 	// is complete. Populated for MsgStorageAppend and MsgStorageApply messages.
 	repeated Message     responses   = 14 [(gogoproto.nullable) = false];
 
-	// NEW FIELDS for Fast Raft
+	// Fast Raft
 	repeated FastVote         fast_votes = 15 [(gogoproto.nullable) = false]; // For MsgFastVote
 	repeated SelfApprovedHint hints      = 16 [(gogoproto.nullable) = false]; // For recovery in MsgVoteResp
+
+
+	// ============= C-RAFT: GLOBAL FIELDS =============
+	// Optional scoping tag; you can skip if you prefer to branch on MessageType.
+	optional Scope            scope        = 17 [(gogoproto.nullable) = false];
+
+	// Global-tier fast path: carry votes specifically for global batches
+	repeated FastVote         global_fast_votes = 18 [(gogoproto.nullable) = false];
+
+	// Global-tier commit/coordinates (mirror of local index/logTerm/commit)
+	optional uint64           global_log_term   = 19 [(gogoproto.nullable) = false];
+	optional uint64           global_index      = 20 [(gogoproto.nullable) = false];
+	optional uint64           global_commit     = 21 [(gogoproto.nullable) = false];
+
+	// Batch payload for MsgGlobalFastProp/MsgGlobalApp
+	optional GlobalBatch      global_batch      = 22;
+
+	// Recovery hints at the global tier (mirrors 'hints' but for batches)
+	repeated SelfApprovedHint global_hints      = 23 [(gogoproto.nullable) = false];
+
+	// Optional ID of the *local* cluster this message is associated with. Useful
+	// if nodes are multi-cluster members as the paper allows.
+	optional uint64           cluster_id        = 24 [(gogoproto.nullable) = false];
 }
 
 message HardState {

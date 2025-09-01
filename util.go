@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"strings"
 
-	pb "go.etcd.io/raft/v3/raftpb"
+	pb "github.com/voyager-db/raftx/raftpb"
 )
 
 func (st StateType) MarshalJSON() ([]byte, error) {
@@ -43,6 +43,7 @@ var isLocalMsg = [...]bool{
 	// They need to be sent over the network
 	// pb.MsgFastProp:       false,  // index 24
 	// pb.MsgFastVote:       false,  // index 25
+	pb.MsgGlobalTimeoutNow: false,
 }
 
 // FAST RAFT: Extended to include MsgFastVote as a response message
@@ -57,6 +58,15 @@ var isResponseMsg = [...]bool{
 	pb.MsgStorageApplyResp:  true,
 	// FAST RAFT: MsgFastVote is a response to MsgFastProp
 	// Note: We need to handle this specially since the array might not be large enough
+	pb.MsgFastVote: true,
+
+	// Global-Raft responses
+	pb.MsgGlobalAppResp:       true,
+	pb.MsgGlobalHeartbeatResp: true,
+	pb.MsgGlobalReadIndexResp: true,
+
+	// Bump array length to cover all messages:
+	pb.MsgGlobalTimeoutNow: false,
 }
 
 func isMsgInArray(msgt pb.MessageType, arr []bool) bool {
@@ -65,6 +75,9 @@ func isMsgInArray(msgt pb.MessageType, arr []bool) bool {
 }
 
 func IsLocalMsg(msgt pb.MessageType) bool {
+	if isGlobalMsg(msgt) {
+		return false
+	}
 	// FAST RAFT: Explicitly handle new message types that are beyond array bounds
 	if msgt == pb.MsgFastProp || msgt == pb.MsgFastVote {
 		return false
@@ -72,11 +85,34 @@ func IsLocalMsg(msgt pb.MessageType) bool {
 	return isMsgInArray(msgt, isLocalMsg[:])
 }
 
+func isGlobalMsg(t pb.MessageType) bool {
+	switch t {
+	case pb.MsgGlobalFastProp,
+		pb.MsgGlobalFastVote,
+		pb.MsgGlobalApp,
+		pb.MsgGlobalAppResp,
+		pb.MsgGlobalHeartbeat,
+		pb.MsgGlobalHeartbeatResp,
+		pb.MsgGlobalReadIndex,
+		pb.MsgGlobalReadIndexResp,
+		pb.MsgGlobalTimeoutNow,
+		pb.MsgGlobalVote,
+		pb.MsgGlobalVoteResp:
+		return true
+	default:
+		return false
+	}
+}
+
 func IsResponseMsg(msgt pb.MessageType) bool {
-	// FAST RAFT: MsgFastVote is a response message
-	if msgt == pb.MsgFastVote {
+	if msgt == pb.MsgFastVote ||
+		msgt == pb.MsgGlobalAppResp ||
+		msgt == pb.MsgGlobalHeartbeatResp ||
+		msgt == pb.MsgGlobalReadIndexResp ||
+		msgt == pb.MsgGlobalVoteResp {
 		return true
 	}
+
 	return isMsgInArray(msgt, isResponseMsg[:])
 }
 
@@ -205,6 +241,14 @@ func describeMessageWithIndent(indent string, m pb.Message, f EntryFormatter) st
 			fmt.Fprintf(&buf, "idx:%d term:%d", h.Index, h.Term)
 		}
 		fmt.Fprint(&buf, "]")
+	}
+
+	// Add global log/commit coordinates if present
+	if m.GlobalCommit != 0 {
+		fmt.Fprintf(&buf, " GCommit:%d", m.GlobalCommit)
+	}
+	if m.GlobalLogTerm != 0 || m.GlobalIndex != 0 {
+		fmt.Fprintf(&buf, " GLog:%d/%d", m.GlobalLogTerm, m.GlobalIndex)
 	}
 
 	if ln := len(m.Entries); ln == 1 {

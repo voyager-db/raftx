@@ -20,8 +20,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	pb "go.etcd.io/raft/v3/raftpb"
-	"go.etcd.io/raft/v3/tracker"
+	pb "github.com/voyager-db/raftx/raftpb"
+	"github.com/voyager-db/raftx/tracker"
 )
 
 // TestFastRaftNoContention tests the fast path with no contention.
@@ -1033,40 +1033,70 @@ func TestFastRaft_NeverOverwriteCommitted(t *testing.T) {
 }
 
 func TestFastRaft_DecisionShipsChosenEntry(t *testing.T) {
-	cfgFast := func(c *Config) { c.EnableFastPath = true }
-	nt := newNetworkWithConfig(cfgFast, nil, nil, nil)
-	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
-	lead := nt.peers[1].(*raft)
+    cfgFast := func(c *Config) { c.EnableFastPath = true }
+    nt := newNetworkWithConfig(cfgFast, nil, nil, nil)
 
-	var idx, term uint64
-	var sawAppWithChosen bool
-	nt.msgHook = func(m pb.Message) bool {
-		if m.Type == pb.MsgFastProp && len(m.Entries) == 1 && len(m.Entries[0].Data) > 0 {
-			idx, term = m.Entries[0].Index, m.Entries[0].Term
-		}
-		if m.Type == pb.MsgApp {
-			for _, e := range m.Entries {
-				if e.Index == idx && string(e.Data) == "CHOSEN" {
-					sawAppWithChosen = true
-				}
-			}
-		}
-		return true
-	}
+    // Start an election and wait until we actually have a leader.
+    nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
+    // Wait loop: nudge the pipeline until leader state is set.
+    var lead *raft
+    for i := 0; i < 100; i++ {
+        if l, ok := nt.peers[1].(*raft); ok && l.state == StateLeader {
+            lead = l
+            break
+        }
+        if l, ok := nt.peers[2].(*raft); ok && l.state == StateLeader {
+            lead = l
+            break
+        }
+        if l, ok := nt.peers[3].(*raft); ok && l.state == StateLeader {
+            lead = l
+            break
+        }
+        nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgBeat})
+    }
+    require.NotNil(t, lead, "no leader elected")
 
-	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: []pb.Entry{{Data: []byte("CHOSEN")}}})
-	require.NotZero(t, idx)
-	dig := entryDigest(&pb.Entry{Index: idx, Term: term, Data: []byte("CHOSEN")})
+    var idx, term uint64
+    var sawAppWithChosen bool
+    nt.msgHook = func(m pb.Message) bool {
+        if m.Type == pb.MsgFastProp && len(m.Entries) == 1 && len(m.Entries[0].Data) > 0 {
+            idx, term = m.Entries[0].Index, m.Entries[0].Term
+        }
+        if m.Type == pb.MsgApp {
+            for _, e := range m.Entries {
+                if e.Index == idx && string(e.Data) == "CHOSEN" {
+                    sawAppWithChosen = true
+                }
+            }
+        }
+        return true
+    }
 
-	// fast quorum for 3-node: leader+2
-	for _, from := range []uint64{2, 3} {
-		_ = lead.Step(pb.Message{Type: pb.MsgFastVote, From: from, To: 1, Index: idx, LogTerm: term, Context: []byte(dig)})
-	}
-	// nudge pipeline
-	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgBeat})
+    // Propose a user entry (fast path will broadcast MsgFastProp).
+    nt.send(pb.Message{
+        From: lead.id, To: lead.id, Type: pb.MsgProp,
+        Entries: []pb.Entry{{Data: []byte("CHOSEN")}},
+    })
+    require.NotZero(t, idx, "no MsgFastProp observed")
 
-	require.True(t, sawAppWithChosen, "leader did not send AppendEntries carrying the chosen entry at idx")
+    dig := entryDigest(&pb.Entry{Index: idx, Term: term, Data: []byte("CHOSEN")})
+
+    // Classic quorum for n=3 is 2. Give the leader self-vote to be explicit,
+    // then two follower votes. (Safe even if your code doesn’t require the self-vote.)
+    _ = lead.Step(pb.Message{Type: pb.MsgFastVote, From: lead.id, To: lead.id, Index: idx, LogTerm: term, Context: []byte(dig)})
+    for _, from := range []uint64{2, 3} {
+        _ = lead.Step(pb.Message{Type: pb.MsgFastVote, From: from, To: lead.id, Index: idx, LogTerm: term, Context: []byte(dig)})
+    }
+
+    // Nudge the pipeline so the leader ships AppendEntries carrying the chosen entry.
+    for i := 0; i < 3 && !sawAppWithChosen; i++ {
+        nt.send(pb.Message{From: lead.id, To: lead.id, Type: pb.MsgBeat})
+    }
+
+    require.True(t, sawAppWithChosen, "leader did not send AppendEntries carrying the chosen entry at idx")
 }
+
 
 func TestFastRaft_RecoveryMultipleHints(t *testing.T) {
 	st := newTestMemoryStorage(withPeers(1, 2, 3))
@@ -1272,45 +1302,44 @@ func TestInsertLeaderChoiceAt_PrefersStoreEntry(t *testing.T) {
 }
 
 func TestInsertLeaderChoiceAt_Fallback_TagUpgradeFromSelf(t *testing.T) {
-    st := newTestMemoryStorage(withPeers(1, 2, 3))
-    cfg := newTestConfig(1, 10, 1, st)
-    cfg.EnableFastPath = true
-    r := newRaft(cfg)
-    r.becomeFollower(1, None)
-    r.becomeCandidate()
-    r.becomeLeader()
+	st := newTestMemoryStorage(withPeers(1, 2, 3))
+	cfg := newTestConfig(1, 10, 1, st)
+	cfg.EnableFastPath = true
+	r := newRaft(cfg)
+	r.becomeFollower(1, None)
+	r.becomeCandidate()
+	r.becomeLeader()
 
-    // Ensure fast-prop store is empty (force store miss).
-    r.fastPropStore = nil
+	// Ensure fast-prop store is empty (force store miss).
+	r.fastPropStore = nil
 
-    // Pick k so that entry(k) already exists: use lastIndex()+1 first to create it,
-    // then bump lastIndex again (so k <= lastIndex holds on the second call).
-    k := r.raftLog.lastIndex() + 1
+	// Pick k so that entry(k) already exists: use lastIndex()+1 first to create it,
+	// then bump lastIndex again (so k <= lastIndex holds on the second call).
+	k := r.raftLog.lastIndex() + 1
 
-    // Write a self-approved entry at k contiguously via local MsgFastProp (doesn't touch store).
-    e := pb.Entry{Index: k, Term: r.Term, Data: []byte("UPGRADE_ME")}
-    require.NoError(t, r.Step(pb.Message{
-        Type:    pb.MsgFastProp,
-        From:    r.id, To: r.id, Term: r.Term,
-        Entries: []pb.Entry{e},
-    }))
-    cur, err := r.raftLog.entry(k)
-    require.NoError(t, err)
-    require.Equal(t, pb.InsertedBySelf, cur.InsertedBy)
+	// Write a self-approved entry at k contiguously via local MsgFastProp (doesn't touch store).
+	e := pb.Entry{Index: k, Term: r.Term, Data: []byte("UPGRADE_ME")}
+	require.NoError(t, r.Step(pb.Message{
+		Type: pb.MsgFastProp,
+		From: r.id, To: r.id, Term: r.Term,
+		Entries: []pb.Entry{e},
+	}))
+	cur, err := r.raftLog.entry(k)
+	require.NoError(t, err)
+	require.Equal(t, pb.InsertedBySelf, cur.InsertedBy)
 
-    // Bump the tail so index <= lastIndex() is definitely true during sparseAppend.
-    // A simple way: append a leader no-op via classic path.
-    require.NoError(t, r.Step(pb.Message{Type: pb.MsgProp, From: r.id, Entries: []pb.Entry{{}}}))
-    require.GreaterOrEqual(t, r.raftLog.lastIndex(), k)
+	// Bump the tail so index <= lastIndex() is definitely true during sparseAppend.
+	// A simple way: append a leader no-op via classic path.
+	require.NoError(t, r.Step(pb.Message{Type: pb.MsgProp, From: r.id, Entries: []pb.Entry{{}}}))
+	require.GreaterOrEqual(t, r.raftLog.lastIndex(), k)
 
-    // Store still misses; digest matches payload at k.
-    dig := entryDigest(&e)
-    r.insertLeaderChoiceAt(k, dig)
+	// Store still misses; digest matches payload at k.
+	dig := entryDigest(&e)
+	r.insertLeaderChoiceAt(k, dig)
 
-    // Assert: tag upgraded to leader, content unchanged.
-    got, err := r.raftLog.entry(k)
-    require.NoError(t, err)
-    assert.Equal(t, []byte("UPGRADE_ME"), got.Data)
-    assert.Equal(t, pb.InsertedByLeader, got.InsertedBy)
+	// Assert: tag upgraded to leader, content unchanged.
+	got, err := r.raftLog.entry(k)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("UPGRADE_ME"), got.Data)
+	assert.Equal(t, pb.InsertedByLeader, got.InsertedBy)
 }
-

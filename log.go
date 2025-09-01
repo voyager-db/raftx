@@ -18,7 +18,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 
-	pb "go.etcd.io/raft/v3/raftpb"
+	pb "github.com/voyager-db/raftx/raftpb"
 )
 
 type raftLog struct {
@@ -797,4 +797,3 @@ func entryDigest(e *pb.Entry) string {
 	h.Write(e.Data)
 	return string(h.Sum(nil)) // or hex if you prefer
 }
-

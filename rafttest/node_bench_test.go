@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"go.etcd.io/raft/v3"
+	raft "github.com/voyager-db/raftx"
 )
 
 func BenchmarkProposal3Nodes(b *testing.B) {

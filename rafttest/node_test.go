@@ -20,7 +20,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"go.etcd.io/raft/v3"
+	raft "github.com/voyager-db/raftx"
 )
 
 func TestBasicProgress(t *testing.T) {

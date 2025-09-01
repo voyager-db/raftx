@@ -20,8 +20,8 @@ import (
 	"math"
 	"strings"
 
-	"go.etcd.io/raft/v3"
-	pb "go.etcd.io/raft/v3/raftpb"
+	raft "github.com/voyager-db/raftx"
+	pb "github.com/voyager-db/raftx/raftpb"
 )
 
 // InteractionOpts groups the options for an InteractionEnv.

@@ -17,7 +17,7 @@ package rafttest
 import (
 	"fmt"
 
-	"go.etcd.io/raft/v3"
+	raft "github.com/voyager-db/raftx"
 )
 
 // isVoter checks whether node id is in the voter list within st.

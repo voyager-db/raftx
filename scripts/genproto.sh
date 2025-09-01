@@ -41,7 +41,7 @@ for dir in ${DIRS}; do
       --plugin="${GOFAST_BIN}" *.proto
 
     # Changed from ./**/*.pb.go to just *.pb.go
-    sed -i.bak -E 's|"raft/raftpb"|"go.etcd.io/etcd/raft/v3/raftpb"|g' *.pb.go
+    sed -i.bak -E 's|"raft/raftpb"|"github.com/voyager-db/raftx/raftpb"|g' *.pb.go
     sed -i.bak -E 's|"google/protobuf"|"github.com/gogo/protobuf/protoc-gen-gogo/descriptor"|g' *.pb.go
 
     rm -f *.bak

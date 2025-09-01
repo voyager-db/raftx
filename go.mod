@@ -1,4 +1,4 @@
-module go.etcd.io/raft/v3
+module github.com/voyager-db/raftx
 
 go 1.24
 

@@ -19,9 +19,9 @@ import (
 
 	"github.com/cockroachdb/datadriven"
 	"github.com/stretchr/testify/require"
+	raft "github.com/voyager-db/raftx"
 
-	"go.etcd.io/raft/v3"
-	"go.etcd.io/raft/v3/raftpb"
+	"github.com/voyager-db/raftx/raftpb"
 )
 
 func (env *InteractionEnv) handleSendSnapshot(t *testing.T, d datadriven.TestData) error {

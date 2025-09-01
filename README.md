@@ -1,4 +1,4 @@
-![Project banner](craft.png)
+<img src="craft.png" alt="Project banner" width="50%">
 
 # Raft + Fast Raft Library + C-Raft (Hierarchical)
 

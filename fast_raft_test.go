@@ -86,6 +86,12 @@ func TestFastRaftContention(t *testing.T) {
 	rn.becomeCandidate()
 	rn.becomeLeader()
 
+	// Fast path is gated until the leader has a commit in its term.
+	// Simulate the no-op’s classic commit so fast path is enabled.
+	rn.raftLog.commitTo(rn.raftLog.lastIndex())
+	// Optional: clear any preexisting messages before this test’s action
+	rn.msgs, rn.msgsAfterAppend = nil, nil
+
 	// ✅ initialize tracker: voters + inflights
 	rn.trk.Voters[0] = map[uint64]struct{}{}
 	for _, id := range peers {
@@ -104,10 +110,11 @@ func TestFastRaftContention(t *testing.T) {
 	// Propose a user entry (fast path should broadcast MsgFastProp)
 	require.NoError(t, rn.Step(pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: []pb.Entry{{Data: []byte("test")}}}))
 
-	// Grab one fast-prop to get index/term/digest
-	require.NotEmpty(t, rn.msgs)
+	all := append([]pb.Message{}, rn.msgs...)
+	all = append(all, rn.msgsAfterAppend...)
+	require.NotEmpty(t, all)
 	var prop pb.Message
-	for _, m := range rn.msgs {
+	for _, m := range all {
 		if m.Type == pb.MsgFastProp {
 			prop = m
 			break
@@ -533,15 +540,21 @@ func TestFastRaftNoClassicBeforeDecision_Local(t *testing.T) {
 	rn.becomeCandidate()
 	rn.becomeLeader()
 
+	// Fast path is gated until the leader has a commit in its term.
+	// Simulate the no-op’s classic commit so fast path is enabled.
+	rn.raftLog.commitTo(rn.raftLog.lastIndex())
+	// Clear any pre-existing messages before this test’s proposal
+	rn.msgs, rn.msgsAfterAppend = nil, nil
+
 	require.NoError(t, rn.Step(pb.Message{Type: pb.MsgProp, From: 1, Entries: []pb.Entry{{Data: []byte("fast")}}}))
 
-	// Inspect outbox *before* any votes supplied.
-	msgs := rn.msgs
-	rn.msgs = nil
+	all := append([]pb.Message{}, rn.msgs...)
+	all = append(all, rn.msgsAfterAppend...)
+	rn.msgs, rn.msgsAfterAppend = nil, nil
 
 	var propIdx, propTerm uint64
 	var sawAppWithPayload bool
-	for _, m := range msgs {
+	for _, m := range all {
 		if m.Type == pb.MsgFastProp && len(m.Entries) == 1 {
 			propIdx, propTerm = m.Entries[0].Index, m.Entries[0].Term
 		}
@@ -693,10 +706,18 @@ func TestFastRaftNextIndexResetOnVote(t *testing.T) {
 	r.becomeCandidate()
 	r.becomeLeader()
 
+	// Fast path is gated until the leader has a commit in its term.
+	// Simulate the no-op’s classic commit so fast path is enabled.
+	r.raftLog.commitTo(r.raftLog.lastIndex())
+	// (Optional) clear preexisting messages before this test’s action
+	r.msgs, r.msgsAfterAppend = nil, nil
+
 	// Propose user entry, capture proposed index/term
 	require.NoError(t, r.Step(pb.Message{Type: pb.MsgProp, From: 1, Entries: []pb.Entry{{Data: []byte("x")}}}))
 	var idx, term uint64
-	for _, m := range r.msgs {
+	all := append([]pb.Message{}, r.msgs...)
+	all = append(all, r.msgsAfterAppend...)
+	for _, m := range all {
 		if m.Type == pb.MsgFastProp && len(m.Entries) == 1 {
 			idx, term = m.Entries[0].Index, m.Entries[0].Term
 			break
@@ -935,6 +956,12 @@ func TestFastRaft_JointConfig_FastQuorum(t *testing.T) {
 	rn.becomeCandidate()
 	rn.becomeLeader()
 
+	// Fast path is gated until the leader has a commit in its term.
+	// Simulate the first-term classic commit (the no-op) so fast path is enabled.
+	rn.raftLog.commitTo(rn.raftLog.lastIndex())
+	// Optional: clear any pre-existing messages before this test’s action
+	rn.msgs, rn.msgsAfterAppend = nil, nil
+
 	// Joint: old {1,2,3}, incoming {1,2,3,4,5}.
 	rn.trk.Voters[0] = map[uint64]struct{}{1: {}, 2: {}, 3: {}}
 	rn.trk.Voters[1] = map[uint64]struct{}{1: {}, 2: {}, 3: {}, 4: {}, 5: {}}
@@ -950,7 +977,9 @@ func TestFastRaft_JointConfig_FastQuorum(t *testing.T) {
 	// Propose; capture k,term.
 	require.NoError(t, rn.Step(pb.Message{Type: pb.MsgProp, From: 1, Entries: []pb.Entry{{Data: []byte("joint")}}}))
 	var k, term uint64
-	for _, m := range rn.msgs {
+	all := append([]pb.Message{}, rn.msgs...)
+	all = append(all, rn.msgsAfterAppend...)
+	for _, m := range all {
 		if m.Type == pb.MsgFastProp && len(m.Entries) == 1 {
 			k, term = m.Entries[0].Index, m.Entries[0].Term
 			break
@@ -1033,70 +1062,69 @@ func TestFastRaft_NeverOverwriteCommitted(t *testing.T) {
 }
 
 func TestFastRaft_DecisionShipsChosenEntry(t *testing.T) {
-    cfgFast := func(c *Config) { c.EnableFastPath = true }
-    nt := newNetworkWithConfig(cfgFast, nil, nil, nil)
+	cfgFast := func(c *Config) { c.EnableFastPath = true }
+	nt := newNetworkWithConfig(cfgFast, nil, nil, nil)
 
-    // Start an election and wait until we actually have a leader.
-    nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
-    // Wait loop: nudge the pipeline until leader state is set.
-    var lead *raft
-    for i := 0; i < 100; i++ {
-        if l, ok := nt.peers[1].(*raft); ok && l.state == StateLeader {
-            lead = l
-            break
-        }
-        if l, ok := nt.peers[2].(*raft); ok && l.state == StateLeader {
-            lead = l
-            break
-        }
-        if l, ok := nt.peers[3].(*raft); ok && l.state == StateLeader {
-            lead = l
-            break
-        }
-        nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgBeat})
-    }
-    require.NotNil(t, lead, "no leader elected")
+	// Start an election and wait until we actually have a leader.
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
+	// Wait loop: nudge the pipeline until leader state is set.
+	var lead *raft
+	for i := 0; i < 100; i++ {
+		if l, ok := nt.peers[1].(*raft); ok && l.state == StateLeader {
+			lead = l
+			break
+		}
+		if l, ok := nt.peers[2].(*raft); ok && l.state == StateLeader {
+			lead = l
+			break
+		}
+		if l, ok := nt.peers[3].(*raft); ok && l.state == StateLeader {
+			lead = l
+			break
+		}
+		nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgBeat})
+	}
+	require.NotNil(t, lead, "no leader elected")
 
-    var idx, term uint64
-    var sawAppWithChosen bool
-    nt.msgHook = func(m pb.Message) bool {
-        if m.Type == pb.MsgFastProp && len(m.Entries) == 1 && len(m.Entries[0].Data) > 0 {
-            idx, term = m.Entries[0].Index, m.Entries[0].Term
-        }
-        if m.Type == pb.MsgApp {
-            for _, e := range m.Entries {
-                if e.Index == idx && string(e.Data) == "CHOSEN" {
-                    sawAppWithChosen = true
-                }
-            }
-        }
-        return true
-    }
+	var idx, term uint64
+	var sawAppWithChosen bool
+	nt.msgHook = func(m pb.Message) bool {
+		if m.Type == pb.MsgFastProp && len(m.Entries) == 1 && len(m.Entries[0].Data) > 0 {
+			idx, term = m.Entries[0].Index, m.Entries[0].Term
+		}
+		if m.Type == pb.MsgApp {
+			for _, e := range m.Entries {
+				if e.Index == idx && string(e.Data) == "CHOSEN" {
+					sawAppWithChosen = true
+				}
+			}
+		}
+		return true
+	}
 
-    // Propose a user entry (fast path will broadcast MsgFastProp).
-    nt.send(pb.Message{
-        From: lead.id, To: lead.id, Type: pb.MsgProp,
-        Entries: []pb.Entry{{Data: []byte("CHOSEN")}},
-    })
-    require.NotZero(t, idx, "no MsgFastProp observed")
+	// Propose a user entry (fast path will broadcast MsgFastProp).
+	nt.send(pb.Message{
+		From: lead.id, To: lead.id, Type: pb.MsgProp,
+		Entries: []pb.Entry{{Data: []byte("CHOSEN")}},
+	})
+	require.NotZero(t, idx, "no MsgFastProp observed")
 
-    dig := entryDigest(&pb.Entry{Index: idx, Term: term, Data: []byte("CHOSEN")})
+	dig := entryDigest(&pb.Entry{Index: idx, Term: term, Data: []byte("CHOSEN")})
 
-    // Classic quorum for n=3 is 2. Give the leader self-vote to be explicit,
-    // then two follower votes. (Safe even if your code doesn’t require the self-vote.)
-    _ = lead.Step(pb.Message{Type: pb.MsgFastVote, From: lead.id, To: lead.id, Index: idx, LogTerm: term, Context: []byte(dig)})
-    for _, from := range []uint64{2, 3} {
-        _ = lead.Step(pb.Message{Type: pb.MsgFastVote, From: from, To: lead.id, Index: idx, LogTerm: term, Context: []byte(dig)})
-    }
+	// Classic quorum for n=3 is 2. Give the leader self-vote to be explicit,
+	// then two follower votes. (Safe even if your code doesn’t require the self-vote.)
+	_ = lead.Step(pb.Message{Type: pb.MsgFastVote, From: lead.id, To: lead.id, Index: idx, LogTerm: term, Context: []byte(dig)})
+	for _, from := range []uint64{2, 3} {
+		_ = lead.Step(pb.Message{Type: pb.MsgFastVote, From: from, To: lead.id, Index: idx, LogTerm: term, Context: []byte(dig)})
+	}
 
-    // Nudge the pipeline so the leader ships AppendEntries carrying the chosen entry.
-    for i := 0; i < 3 && !sawAppWithChosen; i++ {
-        nt.send(pb.Message{From: lead.id, To: lead.id, Type: pb.MsgBeat})
-    }
+	// Nudge the pipeline so the leader ships AppendEntries carrying the chosen entry.
+	for i := 0; i < 3 && !sawAppWithChosen; i++ {
+		nt.send(pb.Message{From: lead.id, To: lead.id, Type: pb.MsgBeat})
+	}
 
-    require.True(t, sawAppWithChosen, "leader did not send AppendEntries carrying the chosen entry at idx")
+	require.True(t, sawAppWithChosen, "leader did not send AppendEntries carrying the chosen entry at idx")
 }
-
 
 func TestFastRaft_RecoveryMultipleHints(t *testing.T) {
 	st := newTestMemoryStorage(withPeers(1, 2, 3))
@@ -1131,6 +1159,12 @@ func TestFastRaft_JointConfig_NoFastCommitOnLargeHalfOnly(t *testing.T) {
 	r.becomeFollower(1, None)
 	r.becomeCandidate()
 	r.becomeLeader()
+
+	// NEW: fast path is gated until the leader has a commit in its term.
+	// Simulate classic replication success by forcing the no-op commit.
+	r.raftLog.commitTo(r.raftLog.lastIndex())
+	// (optional) clear any old messages before this test’s proposal
+	r.msgs, r.msgsAfterAppend = nil, nil
 
 	// Joint: old {1,2,3}, incoming {1,2,3,4,5}
 	r.trk.Voters[0] = map[uint64]struct{}{1: {}, 2: {}, 3: {}}

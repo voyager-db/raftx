@@ -951,6 +951,10 @@ func (r *raft) handleFastVote(m pb.Message) {
 	idx := m.Index
 	digest := string(m.Context)
 
+	// Ignore any fast votes for indexes already committed.
+	if idx <= r.raftLog.committed {
+		return
+	}
 	// (optional, harmless) ignore learners entirely
 	if pr := r.trk.Progress[m.From]; pr == nil || pr.IsLearner {
 		return
@@ -982,7 +986,12 @@ func (r *raft) handleFastVote(m pb.Message) {
 		if pr.Next > idx {
 			pr.Next = idx
 		}
+		// floor Next at max(Match+1, committed+1) per spec ("sentCommitIndex")
 		floor := pr.Match + 1
+		commitFloor := r.raftLog.committed + 1
+		if commitFloor > floor {
+			floor = commitFloor
+		}
 		if pr.Next < floor {
 			pr.Next = floor
 		}
@@ -1533,7 +1542,9 @@ func (r *raft) becomeLeader() {
 				r.processSelfApprovedHint(hint)
 			}
 			// Now that we've seeded counters, try to decide at the next index
-			r.tryDecideAt(r.raftLog.committed + 1)
+			if r.committedEntryInCurrentTerm() {
+				r.tryDecideAt(r.raftLog.committed + 1)
+			}
 
 			r.selfApprovedHints = nil
 		}
@@ -2024,7 +2035,7 @@ func stepLeader(r *raft, m pb.Message) error {
 		// Fast path only for user proposals that are:
 		//   - not the leader no-op
 		//   - not configuration changes
-		if r.enableFastPath && !isLeaderNoop && !hasConfChange {
+		if r.enableFastPath && !isLeaderNoop && !hasConfChange && r.committedEntryInCurrentTerm() {
 			// Proposer -> ALL (including self). Leader won't append here; it will decide after votes.
 			r.broadcastFastProp(m.Entries)
 			return nil

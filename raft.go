@@ -730,30 +730,25 @@ func (r *raft) tryDecideAt(k uint64) {
 		}
 	}
 
-	// 2) Force replication of the chosen entry at k.
+	// 2) Gentle kick: ensure followers will fetch k; send a single append.
 	r.trk.Visit(func(id uint64, pr *tracker.Progress) {
 		if id == r.id || pr.IsLearner {
 			return
 		}
-		if pr.State != tracker.StateProbe {
-			pr.BecomeProbe() // clears inflights safely
+		if pr.Next < k {
+			pr.Next = k
 		}
-		// Next := max(Match+1, k)
-		target := max(k, pr.Match+1)
-		pr.Next = target
-
-		// Kick one append and drain the send pipeline until empty.
-		r.sendAppend(id)
-		for r.maybeSendAppend(id, true /* sendIfEmpty */) {
-		}
+		r.sendAppend(id) // one message; let flow control do the rest
 	})
 
 	// 3) Commit rule
 	term := r.raftLog.zeroTermOnOutOfBounds(r.raftLog.term(k))
 	if r.trk.HasFastQuorum(k) && term == r.Term {
 		r.raftLog.commitTo(k)
+		releasePendingReadIndexMessages(r)
 		r.bcastAppend()
-		// Optional: delete(r.possibleEntries[k])
+		delete(r.possibleEntries, k)
+		delete(r.fastPropStore, k)
 		return
 	}
 	r.bcastAppend()
@@ -1295,6 +1290,13 @@ func (r *raft) appliedSnap(snap *pb.Snapshot) {
 	index := snap.Metadata.Index
 	r.raftLog.stableSnapTo(index)
 	r.appliedTo(index, 0 /* size */)
+
+	if r.raftLog.enableFastPath {
+		r.raftLog.setLastLeaderID(entryID{
+			term:  snap.Metadata.Term,
+			index: snap.Metadata.Index,
+		})
+	}
 }
 
 // === MODIFY maybeCommit TO CHECK FAST PATH ===
@@ -1630,7 +1632,17 @@ func (r *raft) campaign(t CampaignType) {
 			continue
 		}
 		// TODO(pav-kv): it should be ok to simply print %+v for the lastEntryID.
-		last := r.raftLog.lastEntryID()
+		// FAST RAFT: use leader-approved suffix; if empty (cold start),
+		// fall back to classic lastEntryID so first election can succeed.
+		var last entryID
+		if r.enableFastPath {
+			last = r.raftLog.getLastLeaderID()
+			if last.index == 0 { // no leader-approved yet (fresh/snap)
+				last = r.raftLog.lastEntryID()
+			}
+		} else {
+			last = r.raftLog.lastEntryID()
+		}
 		r.logger.Infof("%x [logterm: %d, index: %d] sent %s request to %x at term %d",
 			r.id, last.term, last.index, voteMsg, id, r.Term)
 
@@ -2591,6 +2603,11 @@ func (r *raft) restore(s pb.Snapshot) bool {
 	last := r.raftLog.lastEntryID()
 	r.logger.Infof("%x [commit: %d, lastindex: %d, lastterm: %d] restored snapshot [index: %d, term: %d]",
 		r.id, r.raftLog.committed, last.index, last.term, id.index, id.term)
+
+	// FAST RAFT: seed leader-approved suffix from restored snapshot
+	if r.raftLog.enableFastPath {
+		r.raftLog.setLastLeaderID(entryID{term: s.Metadata.Term, index: s.Metadata.Index})
+	}
 	return true
 }
 

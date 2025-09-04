@@ -118,7 +118,18 @@ func newLogWithSize(storage Storage, logger Logger, maxApplyingEntsSize entryEnc
 // enableFastRaft enables Fast Raft features and initializes leader tracking
 func (l *raftLog) enableFastRaft() {
 	l.enableFastPath = true
+	// 1) try to find a leader-approved entry in the log tail
 	l.updateLastLeaderIndex()
+	// 2) if none found (typical right after a restore), seed from snapshot
+	if l.lastLeaderIndex == 0 {
+		if snap, err := l.storage.Snapshot(); err == nil {
+			// Non-empty snapshot means committed state exists
+			if snap.Metadata.Index > 0 {
+				l.lastLeaderIndex = snap.Metadata.Index
+				l.lastLeaderTerm = snap.Metadata.Term
+			}
+		}
+	}
 }
 
 func (l *raftLog) String() string {
@@ -327,6 +338,13 @@ func (l *raftLog) getLastLeaderID() entryID {
 		term:  l.lastLeaderTerm,
 		index: l.lastLeaderIndex,
 	}
+}
+
+// setLastLeaderID seeds the leader-approved suffix pointer.
+// Safe to call after snapshot/restore or when migrating to fast-raft.
+func (l *raftLog) setLastLeaderID(id entryID) {
+	l.lastLeaderIndex = id.index
+	l.lastLeaderTerm = id.term
 }
 
 // hasGaps reports whether there are any *logical* gaps in [from,to].

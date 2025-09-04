@@ -59,29 +59,42 @@ func NewFastVoteCounter(cfg MajorityConfig) *FastVoteCounter {
 // If the voter previously voted for a different digest, their vote is moved.
 // Returns true if this is a new vote (not a duplicate).
 func (fvc *FastVoteCounter) RecordVote(voterID uint64, digest string) bool {
-	// Check if voter is in the configuration
+	// ignore unknown voters and placeholder voter 0
+	if voterID == 0 {
+		return false
+	}
 	if _, ok := fvc.config[voterID]; !ok {
 		return false
 	}
 
-	// Check if voter already voted for this exact digest
+	if fvc.votes == nil {
+		fvc.votes = make(map[string]map[uint64]struct{})
+	}
+	if fvc.voterChoice == nil {
+		fvc.voterChoice = make(map[uint64]string)
+	}
+
 	if prevDigest, voted := fvc.voterChoice[voterID]; voted {
 		if prevDigest == digest {
-			return false // duplicate vote
+			return false // duplicate
 		}
-		// Remove previous vote
-		delete(fvc.votes[prevDigest], voterID)
-		if len(fvc.votes[prevDigest]) == 0 {
-			delete(fvc.votes, prevDigest)
+		if bucket := fvc.votes[prevDigest]; bucket != nil {
+			delete(bucket, voterID)
+			if len(bucket) == 0 {
+				delete(fvc.votes, prevDigest)
+			}
 		}
 	}
 
-	// Record new vote
-	if fvc.votes[digest] == nil {
-		fvc.votes[digest] = make(map[uint64]struct{})
+	bucket := fvc.votes[digest]
+	if bucket == nil {
+		bucket = make(map[uint64]struct{})
+		fvc.votes[digest] = bucket
 	}
-	fvc.votes[digest][voterID] = struct{}{}
+	bucket[voterID] = struct{}{}
 	fvc.voterChoice[voterID] = digest
+
+	// (optional) enforce K-candidate cap here
 
 	return true
 }

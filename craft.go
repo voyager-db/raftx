@@ -427,14 +427,15 @@ func (r *raft) proposeGlobalStateEntry(batch pb.GlobalBatch) {
 	// Optional hint for tooling:
 	e.IsGlobalState = true
 
-	if r.enableFastPath {
-		r.broadcastFastProp([]pb.Entry{e})
-	} else {
-		if !r.appendEntry(e) {
-			r.logger.Warningf("%x: dropped global-state entry", r.id)
-			return
-		}
-		r.bcastAppend()
+	// Always append locally (classic path), regardless of fast-path setting.
+	// The wrapper must commit locally BEFORE we broadcast the global fast-prop.
+	if !r.appendEntry(e) {
+		r.logger.Warningf("%x: dropped global-state entry", r.id)
+		return
+	}
+	r.bcastAppend()
+	if r.pendingGlobalState == nil {
+		r.pendingGlobalState = make(map[uint64]pb.GlobalBatch)
 	}
 	// Remember to continue once local index k is applied/committed.
 	r.pendingGlobalState[k] = batch
@@ -554,6 +555,8 @@ func (r *raft) handleGlobalFastProp(m pb.Message) error {
 	}
 
 	if m.GlobalBatch != nil {
+		// Normalize/set digest to the canonical value before we persist a wrapper
+		r.setBatchDigest(m.GlobalBatch)
 		gse := pb.GlobalStateEntry{
 			Batch:       m.GlobalBatch,
 			GlobalIndex: m.GlobalIndex,
@@ -682,8 +685,7 @@ func (r *raft) handleGlobalFastVote(m pb.Message) error {
 
 	r.broadcastGlobalChosen(idx)
 
-	// FAST commit if enough votes and same term
-	if r.gtrk.HasFastQuorum(idx) {
+	if r.gtrk.HasFastQuorum(idx) && !globalBatchHasConfChange(chosen) {
 		if t, ok := r.glog.termAt(idx); ok && t == r.gTerm {
 			r.logger.Infof("[G] FAST COMMIT idx=%d", idx)
 			r.glog.commitTo(idx)
@@ -838,14 +840,19 @@ func (r *raft) maybeGlobalCommit() bool {
 	// FAST commit with term guard
 	if fc := r.gtrk.FastCommittable(); fc > r.glog.committed {
 		if t, ok := r.glog.termAt(fc); ok && t == r.gTerm {
-			r.glog.commitTo(fc)
-			for i := r.gCommit + 1; i <= r.glog.committed; i++ {
-				r.applyGlobalCommittedAt(i)
+			// do not fast-commit global config changes
+			if ge, ok := r.glog.ents[fc]; ok && globalBatchHasConfChange(ge.batch) {
+				// fall through to classic check
+			} else {
+				r.glog.commitTo(fc)
+				for i := r.gCommit + 1; i <= r.glog.committed; i++ {
+					r.applyGlobalCommittedAt(i)
+				}
+				r.gCommit = r.glog.committed
+				r.broadcastGlobalChosen(r.gCommit)
+				r.bcastGlobalHeartbeat()
+				return true
 			}
-			r.gCommit = r.glog.committed
-			r.broadcastGlobalChosen(r.gCommit)
-			r.bcastGlobalHeartbeat()
-			return true
 		}
 	}
 	// classic majority commit (unchanged)
@@ -932,6 +939,19 @@ func globalBatchDigest(b *pb.GlobalBatch) string {
 		h.Write(e.Data)
 	}
 	return string(h.Sum(nil))
+}
+
+func globalBatchHasConfChange(b *pb.GlobalBatch) bool {
+	if b == nil {
+		return false
+	}
+	for i := range b.Entries {
+		switch b.Entries[i].Type {
+		case pb.EntryConfChange, pb.EntryConfChangeV2:
+			return true
+		}
+	}
+	return false
 }
 
 func (r *raft) rememberGlobalBatch(idx uint64, b *pb.GlobalBatch) {

@@ -796,10 +796,14 @@ func (r *raft) broadcastFastProp(ents []pb.Entry) {
 	// Propose at the next uncommitted index (Fast Raft proposer chooses i).
 	k := r.raftLog.committed + 1
 
+	if r.possibleEntries == nil {
+		r.possibleEntries = make(map[uint64]*quorum.FastVoteCounter)
+	}
+
 	for i := range ents {
 		e := ents[i]
 		e.Index = k + uint64(i)
-		e.Term = r.Term // safe: followers will still mark InsertedBy=self
+		e.Term = r.Term // followers still mark InsertedBy=self
 
 		// Remember for later (so the leader can materialize the chosen entry).
 		r.rememberFastPropEntry(e)
@@ -809,16 +813,35 @@ func (r *raft) broadcastFastProp(ents []pb.Entry) {
 			Entries: []pb.Entry{e},
 		}
 
-		// Send to every peer; deliver locally without using send().
-		r.trk.Visit(func(id uint64, _ *tracker.Progress) {
-			if id == r.id {
-				// Local delivery: call the handler directly.
-				r.handleFastProp(base)
+		r.trk.Visit(func(id uint64, pr *tracker.Progress) {
+			// Skip non-voters/learners
+			if pr == nil || pr.IsLearner {
 				return
 			}
+			if id == r.id {
+				// Leader: count own fast vote directly (no local handle/log work)
+				dig := entryDigest(&e)
+
+				ctr := r.possibleEntries[e.Index]
+				if ctr == nil {
+					cfg := quorum.MajorityConfig{}
+					for vid := range r.trk.Voters.IDs() {
+						cfg[vid] = struct{}{}
+					}
+					ctr = quorum.NewFastVoteCounter(cfg)
+					r.possibleEntries[e.Index] = ctr
+				}
+
+				// Only decide on a *new* vote; avoids churn under retries
+				if ctr.RecordVote(r.id, dig) && e.Index == r.raftLog.committed+1 {
+					r.tryDecideAt(e.Index)
+				}
+				return
+			}
+
 			m := base
 			m.To = id
-			r.send(m) // send() will fill From/Term; not self-addressed.
+			r.send(m)
 		})
 	}
 }
@@ -928,31 +951,47 @@ func (r *raft) handleFastVote(m pb.Message) {
 	idx := m.Index
 	digest := string(m.Context)
 
+	// (optional, harmless) ignore learners entirely
+	if pr := r.trk.Progress[m.From]; pr == nil || pr.IsLearner {
+		return
+	}
+
+	// ensure map
+	if r.possibleEntries == nil {
+		r.possibleEntries = make(map[uint64]*quorum.FastVoteCounter)
+	}
 	ctr := r.possibleEntries[idx]
 	if ctr == nil {
 		cfg := quorum.MajorityConfig{}
-		for id := range r.trk.Voters.IDs() { // <- voters, not progress
+		for id := range r.trk.Voters.IDs() { // voters only
 			cfg[id] = struct{}{}
 		}
-		if r.possibleEntries == nil {
-			r.possibleEntries = make(map[uint64]*quorum.FastVoteCounter)
-		}
-		ctr = quorum.NewFastVoteCounter(cfg)
+		ctr = quorum.NewFastVoteCounter(cfg) // must init its internal maps
 		r.possibleEntries[idx] = ctr
 	}
 
-	ctr.RecordVote(m.From, digest)
-
-	// Anchor the voter's Next to idx so we don't skip the write.
-	if pr := r.trk.Progress[m.From]; pr != nil && pr.Next > idx {
-		pr.Next = idx
-	}
-
-	k := r.raftLog.committed + 1
-	if idx != k {
+	// Only act on a *new* vote; skip duplicates to avoid churn
+	if !ctr.RecordVote(m.From, digest) {
 		return
 	}
-	r.tryDecideAt(k)
+
+	// Anchor the voter’s Next to *not skip* the chosen index:
+	// - Only lower Next to idx if Next > idx
+	// - Clamp to at least Match+1 (Raft invariant)
+	if pr := r.trk.Progress[m.From]; pr != nil {
+		if pr.Next > idx {
+			pr.Next = idx
+		}
+		floor := pr.Match + 1
+		if pr.Next < floor {
+			pr.Next = floor
+		}
+	}
+
+	// Only try to decide at the next undecided index
+	if idx == r.raftLog.committed+1 {
+		r.tryDecideAt(idx)
+	}
 }
 
 // includeSelfApprovedHints adds hints to vote response messages

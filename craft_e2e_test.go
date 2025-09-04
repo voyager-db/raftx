@@ -266,8 +266,115 @@ func waitFastPropReceived(t *testing.T, leaders map[uint64]*raft, leaderIDs []ui
 			continue
 		}
 		r := leaders[id]
-		if len(r.pendingGlobalAcks) == 0 && !r.hasCommittedGlobalStateFor(gi) {
-			t.Fatalf("leader %x did not receive global fast-prop (no pendingGlobalAcks and no committed wrapper)", id)
+		if len(r.pendingGlobalAcks) == 0 &&
+			!r.hasCommittedGlobalStateFor(gi) &&
+			!hasQueuedGlobalFastVoteFor(r, gi) {
+			t.Fatalf("leader %x did not receive global fast-prop (no pendingGlobalAcks, no committed wrapper, no queued vote)", id)
+		}
+	}
+}
+
+// Evidence that follower processed the global fast-prop:
+// 1) pending wrapper ack exists, OR
+// 2) committed wrapper for gi exists, OR
+// 3) queued MsgGlobalFastVote for gi exists.
+func hasQueuedGlobalFastVoteFor(r *raft, gi uint64) bool {
+	all := append([]pb.Message{}, r.msgs...)
+	all = append(all, r.msgsAfterAppend...)
+	for _, m := range all {
+		if m.Type == pb.MsgGlobalFastVote && m.GlobalIndex == gi {
+			return true
+		}
+	}
+	return false
+}
+
+func fastPropReceivedOn(r *raft, gi uint64) bool {
+	if len(r.pendingGlobalAcks) > 0 { // any pending ack is sufficient signal
+		return true
+	}
+	if r.hasCommittedGlobalStateFor(gi) {
+		return true
+	}
+	if hasQueuedGlobalFastVoteFor(r, gi) {
+		return true
+	}
+	return false
+}
+
+func waitFastPropReceivedSpin(t *testing.T, net *e2eNet, leaders map[uint64]*raft, leaderIDs []uint64, glID uint64, rounds int) {
+	t.Helper()
+	gi := currentGlobalIndexFromLeader(leaders[glID])
+	for r := 0; r < rounds; r++ {
+		ok := true
+		for _, id := range leaderIDs {
+			if id == glID {
+				continue
+			}
+			if !fastPropReceivedOn(leaders[id], gi) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return
+		}
+		net.pump(t) // allow delivery/processing
+	}
+	// final check to produce a useful error
+	for _, id := range leaderIDs {
+		if id == glID {
+			continue
+		}
+		if !fastPropReceivedOn(leaders[id], gi) {
+			t.Fatalf("leader %x did not receive global fast-prop (no pendingGlobalAcks, no committed wrapper, no queued vote) for gIdx=%d", id, gi)
+		}
+	}
+}
+
+func waitGlobalVotesQueuedSpin(t *testing.T, net *e2eNet, leaders map[uint64]*raft, leaderIDs []uint64, glID uint64, rounds int) {
+	t.Helper()
+	for r := 0; r < rounds; r++ {
+		ok := true
+		for _, id := range leaderIDs {
+			if id == glID {
+				continue
+			}
+			queued := false
+			all := append([]pb.Message{}, leaders[id].msgs...)
+			all = append(all, leaders[id].msgsAfterAppend...)
+			for _, m := range all {
+				if m.Type == pb.MsgGlobalFastVote {
+					queued = true
+					break
+				}
+			}
+			if !queued {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return
+		}
+		net.pump(t)
+	}
+	// final check
+	for _, id := range leaderIDs {
+		if id == glID {
+			continue
+		}
+		found := false
+		all := append([]pb.Message{}, leaders[id].msgs...)
+		all = append(all, leaders[id].msgsAfterAppend...)
+		for _, m := range all {
+			if m.Type == pb.MsgGlobalFastVote {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("leader %x did not queue MsgGlobalFastVote; wrapper likely not committed locally", id)
 		}
 	}
 }
@@ -586,16 +693,18 @@ func TestCRaft_E2E_GlobalConfChange_JointConfig(t *testing.T) {
 		leaders[lid] = cl[lid]
 		leaderIDs = append(leaderIDs, lid)
 	}
+
 	net := newE2ENet(all)
 	e2eInitGlobalMembershipOnLeaders(leaders, leaderIDs)
 
+	// Pick global leader and bootstrap
 	glID := leaderIDs[0]
 	gl := leaders[glID]
 	gl.gTerm++
 	gl.becomeGlobalLeader()
 	net.pump(t)
 
-	// Find the global leader's local cluster (you were missing this)
+	// Find the global leader's local cluster
 	var glCluster map[uint64]*raft
 	for _, cl := range clusters {
 		if _, ok := cl[glID]; ok {
@@ -607,30 +716,51 @@ func TestCRaft_E2E_GlobalConfChange_JointConfig(t *testing.T) {
 		t.Fatal("failed to locate the global leader's local cluster")
 	}
 
-	// Build a global batch that contains a ConfChangeV2
+	// Build a global batch that contains a ConfChangeV2 (REMOVE an existing voter)
+	removed := leaderIDs[2] // ensure this is != glID
 	cc := pb.ConfChangeV2{
-		Changes: []pb.ConfChangeSingle{{Type: pb.ConfChangeAddNode, NodeID: leaderIDs[2]}},
+		Changes: []pb.ConfChangeSingle{{Type: pb.ConfChangeRemoveNode, NodeID: removed}},
 	}
 	b, _ := cc.Marshal()
 	ent := pb.Entry{Type: pb.EntryConfChangeV2, Data: b}
 
-	// ✅ Propose and force wrapper commit before broadcast
+	// Propose and force local wrapper commit before broadcast
 	e2eProposeGlobalBatchWithEntries(t, net, glCluster, gl, []pb.Entry{ent})
 
-	// Followers commit their wrappers and send votes
+	// Give the broadcast a hop to reach followers
+	net.pump(t)
+
+	// Make sure non-global leaders actually *received* the fast-prop (wrappers recorded / vote queued)
+	waitFastPropReceivedSpin(t, net, leaders, leaderIDs, glID, 20)
+
+	// Ensure followers commit their wrappers and queue votes
 	for _, id := range leaderIDs {
 		if id != glID {
 			forceLocalCommitAll(leaders[id])
 		}
 	}
-	net.pump(t) // deliver votes/decision
-	net.pump(t) // replicate/apply
+	waitGlobalVotesQueuedSpin(t, net, leaders, leaderIDs, glID, 20)
 
-	// Should commit and apply config — tracker must contain progress for all IDs
+	// Deliver votes and drive decision (conf change => classic fallback)
+	net.pump(t) // deliver votes
+	net.pump(t) // replicate chosen batch
+	net.pump(t) // commit & apply
+
+	// Should commit and apply config — gCommit should be > 0
 	if gl.gCommit == 0 {
 		t.Fatalf("global conf change not committed")
 	}
+
+	// Removed node's progress should be gone after apply
+	if gl.gtrk.Progress[removed] != nil {
+		t.Fatalf("removed node %x still present in global tracker after conf change", removed)
+	}
+
+	// Remaining leaders should still have progress
 	for _, id := range leaderIDs {
+		if id == removed {
+			continue
+		}
 		if gl.gtrk.Progress[id] == nil {
 			t.Fatalf("progress missing for %x after conf change", id)
 		}

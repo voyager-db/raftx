@@ -749,10 +749,27 @@ func (r *raft) tryDecideAt(k uint64) {
 		r.bcastAppend()
 		delete(r.possibleEntries, k)
 		delete(r.fastPropStore, k)
+		r.pruneFastWindow()
 		return
 	}
 	r.bcastAppend()
-	// Optional: delete(r.possibleEntries[k])
+}
+
+const fastWindow = 2048 // tune
+
+func (r *raft) pruneFastWindow() {
+	floor := r.raftLog.committed + 1
+	ceil := floor + fastWindow
+	for idx := range r.possibleEntries {
+		if idx < floor || idx > ceil {
+			delete(r.possibleEntries, idx)
+		}
+	}
+	for idx := range r.fastPropStore {
+		if idx < floor || idx > ceil {
+			delete(r.fastPropStore, idx)
+		}
+	}
 }
 
 // insertLeaderChoiceAt ensures the chosen entry is written at index k
@@ -882,7 +899,7 @@ func (r *raft) handleFastProp(m pb.Message) {
 		}
 
 		// Optionally fold any now-contiguous buffered entries.
-		for {
+		for folded := 0; folded < 32; folded++ {
 			next := r.raftLog.lastIndex() + 1
 			buf, ok := r.pendingSelf[next]
 			if !ok {
@@ -894,7 +911,14 @@ func (r *raft) handleFastProp(m pb.Message) {
 	} else {
 		// Gap: keep in side buffer, do not touch log yet.
 		e.InsertedBy = pb.InsertedBySelf
-		r.pendingSelf[e.Index] = e
+		// Bound the buffer size and distance from the tail
+		const maxPendingSelf = 8192
+		if r.pendingSelf == nil {
+			r.pendingSelf = make(map[uint64]pb.Entry)
+		}
+		if len(r.pendingSelf) < maxPendingSelf && e.Index <= r.raftLog.lastIndex()+fastWindow {
+			r.pendingSelf[e.Index] = e
+		}
 
 		if e.IsGlobalState {
 			var gse pb.GlobalStateEntry
@@ -2247,6 +2271,7 @@ func stepLeader(r *raft, m pb.Message) error {
 					// to respond to pending read index requests
 					releasePendingReadIndexMessages(r)
 					r.bcastAppend()
+					r.pruneFastWindow()
 				} else if r.id != m.From && pr.CanBumpCommit(r.raftLog.committed) {
 					// This node may be missing the latest commit index, so send it.
 					// NB: this is not strictly necessary because the periodic heartbeat
@@ -2735,6 +2760,7 @@ func (r *raft) switchToConfig(cfg tracker.Config, trk tracker.ProgressMap) pb.Co
 		// If the configuration change means that more entries are committed now,
 		// broadcast/append to everyone in the updated config.
 		r.bcastAppend()
+		r.pruneFastWindow()
 	} else {
 		// Otherwise, still probe the newly added replicas; there's no reason to
 		// let them wait out a heartbeat interval (or the next incoming

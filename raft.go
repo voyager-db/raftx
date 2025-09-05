@@ -706,6 +706,15 @@ func (r *raft) lookupEntryByDigest(index uint64, digest string) (pb.Entry, bool)
 	return pb.Entry{}, false
 }
 
+// --- helper: log when commit actually advances ---
+func (r *raft) logCommitAdvance(prev uint64) {
+	if r.raftLog.committed != prev {
+		t := r.raftLog.zeroTermOnOutOfBounds(r.raftLog.term(r.raftLog.committed))
+		r.logger.Infof("[COMMIT] node=%x commit=%d termOfCommit=%d leaderTerm=%d",
+			r.id, r.raftLog.committed, t, r.Term)
+	}
+}
+
 // tryDecideAt runs the Fast-Raft decision for index k:
 // - choose the max-voted digest if classic quorum of votes exists
 // - insert it as leader-approved
@@ -760,7 +769,9 @@ func (r *raft) tryDecideAt(k uint64) {
 	// 3) Commit rule
 	term := r.raftLog.zeroTermOnOutOfBounds(r.raftLog.term(k))
 	if r.trk.HasFastQuorum(k) && term == r.Term {
+		prev := r.raftLog.committed
 		r.raftLog.commitTo(k)
+		r.logCommitAdvance(prev)
 		r.clampFastNext()
 		releasePendingReadIndexMessages(r)
 		r.bcastAppend()
@@ -1453,8 +1464,9 @@ func (r *raft) maybeCommit() bool {
 		if fc := r.trk.FastCommittable(); fc > r.raftLog.committed {
 			term, err := r.raftLog.term(fc)
 			if err == nil && term == r.Term {
-				r.logger.Infof("%x fast committing via tracker to %d", r.id, fc)
+				prev := r.raftLog.committed
 				r.raftLog.commitTo(fc)
+				r.logCommitAdvance(prev) 
 				r.clampFastNext()
 				return true
 			}

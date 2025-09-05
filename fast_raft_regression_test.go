@@ -376,19 +376,25 @@ func majoritySize(cfg quorum.MajorityConfig) int {
 func TestFastRaft_FastPropIndicesShouldAdvanceWhenCommitStalled(t *testing.T) {
 	r := makeRestartedFastRaft(t, 1, []uint64{1, 2, 3, 4, 5})
 
-	// Make the leader; but don't let commit advance (no votes/acks).
+	// Become leader.
 	r.becomeCandidate()
 	r.becomeLeader()
+
+	// NEW: enable fast path by committing the leader's no-op in this term.
+	// We still keep commit "stalled" after this initial bootstrap commit.
+	r.raftLog.commitTo(r.raftLog.lastIndex())
 
 	// Call broadcastFastProp twice with one entry each.
 	r.broadcastFastProp([]pb.Entry{{Type: pb.EntryNormal, Data: []byte("a")}})
 	firstIdx := r.raftLog.committed + 1
+
 	// Capture the actual assigned index via possibleEntries keys.
 	if _, ok := r.possibleEntries[firstIdx]; !ok {
 		t.Fatalf("expected counter at %d after first fast prop", firstIdx)
 	}
 
 	r.broadcastFastProp([]pb.Entry{{Type: pb.EntryNormal, Data: []byte("b")}})
+
 	// Expect the *second* proposal to use a *new* index (monotonic).
 	secondIdx := firstIdx + 1
 	if _, ok := r.possibleEntries[secondIdx]; !ok {
@@ -396,13 +402,16 @@ func TestFastRaft_FastPropIndicesShouldAdvanceWhenCommitStalled(t *testing.T) {
 	}
 }
 
+
 func TestFastRaft_FastProp_NoDigestBlowup_AndWindowBound(t *testing.T) {
 	// Fresh 5-voter group; leader elected; commit will remain stalled.
 	r := makeRestartedFastRaft(t, 1, []uint64{1, 2, 3, 4, 5})
 	r.becomeCandidate()
 	r.becomeLeader()
 
-	// One initial fast proposal to establish the "firstIdx".
+	r.raftLog.commitTo(r.raftLog.lastIndex())
+
+	// Now the seed proposal will go through the fast path.
 	r.broadcastFastProp([]pb.Entry{{Type: pb.EntryNormal, Data: []byte("seed")}})
 	firstIdx := r.raftLog.committed + 1
 	if _, ok := r.possibleEntries[firstIdx]; !ok {
@@ -496,5 +505,144 @@ func TestFastRaft_FastStateBoundedWithoutCommit(t *testing.T) {
 	const slack = 64
 	if len(r.possibleEntries) > fastWindow+slack {
 		t.Fatalf("possibleEntries grew unbounded: got %d, want <= %d", len(r.possibleEntries), fastWindow+slack)
+	}
+}
+
+
+// ===== Boot-stability tests: gate, backpressure, follower bound =====
+
+// helper: count messages of a given type in the raft's outbound queues.
+func countMsgs(r *raft, mt pb.MessageType) int {
+	n := 0
+	for _, m := range r.msgs {
+		if m.Type == mt {
+			n++
+		}
+	}
+	for _, m := range r.msgsAfterAppend {
+		if m.Type == mt {
+			n++
+		}
+	}
+	return n
+}
+
+// 1) Gate: no fast-broadcast before the leader has a commit in its term.
+//    - Before committing the leader no-op, proposals must go via classic (no MsgFastProp).
+//    - After committing in this term, fast proposals appear.
+func TestFastRaft_GateFastUntilLeaderTermCommitted(t *testing.T) {
+	r := makeRestartedFastRaft(t, 1, []uint64{1, 2, 3})
+
+	// Elect leader; leader no-op is appended but NOT yet committed in this term.
+	r.becomeFollower(1, None)
+	r.becomeCandidate()
+	r.becomeLeader()
+	r.msgs, r.msgsAfterAppend = nil, nil
+
+	// Propose once (goes through stepLeader -> broadcastFastProp).
+	// Gate should force classic replication (no fast props yet).
+	if err := r.Step(pb.Message{
+		Type: pb.MsgProp, From: r.id, Entries: []pb.Entry{{Type: pb.EntryNormal, Data: []byte("boot-1")}},
+	}); err != nil {
+		t.Fatalf("prop boot-1: %v", err)
+	}
+	if n := countMsgs(r, pb.MsgFastProp); n != 0 {
+		t.Fatalf("unexpected fast proposals before leader-term commit: %d", n)
+	}
+	if n := countMsgs(r, pb.MsgApp); n == 0 {
+		t.Fatalf("expected classic MsgApp before leader-term commit")
+	}
+
+	// Now simulate that the leader has committed in its term (boot barrier).
+	r.raftLog.commitTo(r.raftLog.lastIndex())
+	r.msgs, r.msgsAfterAppend = nil, nil
+
+	// Propose again; now fast path is allowed.
+	if err := r.Step(pb.Message{
+		Type: pb.MsgProp, From: r.id, Entries: []pb.Entry{{Type: pb.EntryNormal, Data: []byte("boot-2")}},
+	}); err != nil {
+		t.Fatalf("prop boot-2: %v", err)
+	}
+	if n := countMsgs(r, pb.MsgFastProp); n == 0 {
+		t.Fatalf("expected fast proposals after leader-term commit")
+	}
+}
+
+// 2) Backpressure: when the fast window is nearly full, split the batch.
+//    - Only the remaining capacity goes fast (possibleEntries grows by <= cap).
+//    - Overflow routes via classic (MsgApp present), keeping progress.
+func TestFastRaft_BackpressureSplitsBatch(t *testing.T) {
+	r := makeRestartedFastRaft(t, 1, []uint64{1, 2, 3})
+
+	// Become leader and commit no-op so fast path is enabled.
+	r.becomeFollower(1, None)
+	r.becomeCandidate()
+	r.becomeLeader()
+	r.raftLog.commitTo(r.raftLog.lastIndex())
+
+	frontier := r.raftLog.committed + 1
+	// Leave exactly two slots of capacity in the fast window.
+	r.fastNext = frontier + fastWindow - 2
+
+	// Batch of 5 (2 should go fast, 3 overflow classic).
+	batch := make([]pb.Entry, 5)
+	for i := range batch {
+		batch[i] = pb.Entry{Type: pb.EntryNormal, Data: []byte("x")}
+	}
+	r.msgs, r.msgsAfterAppend = nil, nil
+
+	if err := r.Step(pb.Message{Type: pb.MsgProp, From: r.id, Entries: batch}); err != nil {
+		t.Fatalf("prop batch: %v", err)
+	}
+
+	// Count how many fast indices materialized near the tail.
+	fastCreated := 0
+	for idx := range r.possibleEntries {
+		// anything >= original r.fastNext-5 and within window is counted
+		if idx >= frontier && idx < frontier+uint64(fastWindow) {
+			fastCreated++
+		}
+	}
+	if fastCreated > 2 {
+		t.Fatalf("backpressure failed: created %d fast indices, want <= 2", fastCreated)
+	}
+	// Expect classic replication for the overflow.
+	if n := countMsgs(r, pb.MsgApp); n == 0 {
+		t.Fatalf("expected classic MsgApp for overflow when fast window is full")
+	}
+}
+
+// 3) Follower bound: pendingSelf stays capped and within active window.
+//    - Flood out-of-order fast proposals far ahead.
+//    - Verify pendingSelf size <= cap and indices are within [committed+1, committed+fastWindow].
+func TestFastRaft_FollowerPendingSelfBound(t *testing.T) {
+	r := makeRestartedFastRaft(t, 2, []uint64{1, 2, 3}) // follower id=2
+	// Simulate a leader id for routing votes (not used heavily here).
+	r.lead = 1
+
+	// Flood far-future proposals (beyond the contiguous tail).
+	start := r.raftLog.lastIndex() + fastWindow + 100
+	for i := 0; i < 5000; i++ {
+		e := pb.Entry{
+			Type:  pb.EntryNormal,
+			Index: start + uint64(i),
+			Term:  r.Term,
+			Data:  []byte("flood"),
+		}
+		m := pb.Message{Type: pb.MsgFastProp, From: r.lead, To: r.id, Entries: []pb.Entry{e}}
+		r.handleFastProp(m)
+	}
+
+	// Assert follower buffer cap (adjust if you picked a different cap than 1024).
+	if len(r.pendingSelf) > 1024 {
+		t.Fatalf("pendingSelf grew unbounded: got %d, want <= 1024", len(r.pendingSelf))
+	}
+	// And ensure buffered indexes remain within the active window.
+	floor := r.raftLog.committed + 1
+	ceil := floor + fastWindow
+	for idx := range r.pendingSelf {
+		if idx < floor || idx > ceil {
+			t.Fatalf("pendingSelf contains out-of-window index %d not in [%d,%d]", idx, floor, ceil)
+		}
 	}
 }

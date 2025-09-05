@@ -820,77 +820,120 @@ func (r *raft) insertLeaderChoiceAt(k uint64, digest string) {
 }
 
 // broadcastFastProp sends MsgFastProp for the given entries on the fast path.
-// It assigns indices starting at commitIndex+1, remembers the entries
-// for later materialization, and delivers locally without using send()
-// to avoid self-addressed invariant violations.
+// It assigns indices using the leader-local cursor (fastNext), bounded by a
+// window ahead of committed+1. Overflow is routed via classic Raft so progress
+// continues even when the fast window is full.
 func (r *raft) broadcastFastProp(ents []pb.Entry) {
 	if !r.enableFastPath || len(ents) == 0 {
 		return
 	}
-	// Ensure the cursor is not behind the commit frontier (important if commit
-	// moved since we last advanced the cursor, e.g. tests call commitTo()).
+
+	// 0) Hard gate: do NOT use fast path until the leader has at least one
+	// commit in its current term. This prevents boot-time starvation/flapping.
+	if !r.committedEntryInCurrentTerm() {
+		if !r.appendEntry(ents...) { // classic append
+			return
+		}
+		r.bcastAppend()
+		return
+	}
+
+	// 1) Clamp the proposal cursor to the current frontier in case commit moved
+	// since the last broadcast (e.g., classic commit, external tests).
 	r.clampFastNext()
+	frontier := r.raftLog.committed + 1 // stable snapshot for this call
 
-	// Propose at the leader-local cursor (monotonic across batches).
-	k := r.fastNext
-	if k == 0 { // defensive for mixed upgrades; seed lazily
-		k = r.raftLog.committed + 1
-		r.fastNext = k
+	// 2) Compute remaining fast-window capacity and split the batch:
+	//    - up to 'capFast' entries go through the fast path
+	//    - any overflow is appended classically to avoid flooding
+	var capFast int
+	{
+		// inflight = fastNext - frontier; capacity left = fastWindow - inflight
+		inflight := int64(r.fastNext - frontier)
+		if inflight < 0 {
+			inflight = 0
+		}
+		left := int64(fastWindow) - inflight
+		if left < 0 {
+			left = 0
+		}
+		if left > int64(len(ents)) {
+			capFast = len(ents)
+		} else {
+			capFast = int(left)
+		}
 	}
 
-	if r.possibleEntries == nil {
-		r.possibleEntries = make(map[uint64]*quorum.FastVoteCounter)
-	}
+	fastBatch := ents[:capFast]
+	restBatch := ents[capFast:] // classic fallback, if any
 
-	for i := range ents {
-		e := ents[i]
-		e.Index = k + uint64(i)
-		e.Term = r.Term // followers still mark InsertedBy=self
-
-		// Remember for later (so the leader can materialize the chosen entry).
-		r.rememberFastPropEntry(e)
-
-		base := pb.Message{
-			Type:    pb.MsgFastProp,
-			Entries: []pb.Entry{e},
+	// 3) Fast-broadcast the portion that fits in the window.
+	if len(fastBatch) > 0 {
+		k := r.fastNext
+		if k == 0 {
+			k = frontier
+			r.fastNext = k
 		}
 
-		r.trk.Visit(func(id uint64, pr *tracker.Progress) {
-			// Skip non-voters/learners
-			if pr == nil || pr.IsLearner {
-				return
-			}
-			if id == r.id {
-				// Leader: count own fast vote directly (no local handle/log work)
-				dig := entryDigest(&e)
+		if r.possibleEntries == nil {
+			r.possibleEntries = make(map[uint64]*quorum.FastVoteCounter)
+		}
 
-				ctr := r.possibleEntries[e.Index]
-				if ctr == nil {
-					cfg := quorum.MajorityConfig{}
-					for vid := range r.trk.Voters.IDs() {
-						cfg[vid] = struct{}{}
+		for i := range fastBatch {
+			e := fastBatch[i]
+			e.Index = k + uint64(i)
+			e.Term = r.Term // followers will tag InsertedBy=self on receive
+
+			// Remember for materialization/decision.
+			r.rememberFastPropEntry(e)
+
+			base := pb.Message{
+				Type:    pb.MsgFastProp,
+				Entries: []pb.Entry{e},
+			}
+
+			r.trk.Visit(func(id uint64, pr *tracker.Progress) {
+				if pr == nil || pr.IsLearner {
+					return
+				}
+				if id == r.id {
+					// Leader self-vote (no local message pass).
+					dig := entryDigest(&e)
+					ctr := r.possibleEntries[e.Index]
+					if ctr == nil {
+						cfg := quorum.MajorityConfig{}
+						for vid := range r.trk.Voters.IDs() {
+							cfg[vid] = struct{}{}
+						}
+						ctr = quorum.NewFastVoteCounter(cfg)
+						r.possibleEntries[e.Index] = ctr
 					}
-					ctr = quorum.NewFastVoteCounter(cfg)
-					r.possibleEntries[e.Index] = ctr
+					// Only decide at the *frontier* (k == committed+1 snapshot).
+					if ctr.RecordVote(r.id, dig) && e.Index == frontier {
+						r.tryDecideAt(e.Index)
+					}
+					return
 				}
+				m := base
+				m.To = id
+				r.send(m)
+			})
+		}
 
-				// Only decide on a *new* vote; avoids churn under retries
-				if ctr.RecordVote(r.id, dig) && e.Index == r.raftLog.committed+1 {
-					r.tryDecideAt(e.Index)
-				}
-				return
-			}
-
-			m := base
-			m.To = id
-			r.send(m)
-		})
+		// Advance the cursor past the portion we actually fast-proposed.
+		r.fastNext = k + uint64(len(fastBatch))
+		// Keep fast-window maps tidy even if commit is stalled.
+		r.pruneFastWindow()
 	}
 
-	// Advance the cursor past this batch.
-	r.fastNext = k + uint64(len(ents))
-	// Keep the window tidy even if commit is stalled.
-	r.pruneFastWindow()
+	// 4) Route any overflow via classic Raft so progress continues (and avoid
+	// flooding memory when the fast window is full).
+	if len(restBatch) > 0 {
+		if !r.appendEntry(restBatch...) {
+			return
+		}
+		r.bcastAppend()
+	}
 }
 
 // handleFastProp processes an incoming MsgFastProp (follower side and leader self-delivery).

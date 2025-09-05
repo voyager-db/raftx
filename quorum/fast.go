@@ -24,8 +24,10 @@ import (
 // A fast quorum requires agreement from three-quarters of the nodes (rounded up).
 // This ensures that any fast quorum intersects with any classic majority quorum.
 func FastQuorumSize(n int) int {
-	// ceil(3n/4) = (3n + 3) / 4
-	return (3*n + 3) / 4
+	if n <= 0 {
+		return 0
+	}
+	return (3*n + 3) / 4 // ceil(3n/4)
 }
 
 // ClassicQuorumSize returns the size of a classic majority quorum (⌈(n+1)/2⌉).
@@ -53,6 +55,10 @@ func NewFastVoteCounter(cfg MajorityConfig) *FastVoteCounter {
 		votes:       make(map[string]map[uint64]struct{}),
 		voterChoice: make(map[uint64]string),
 	}
+}
+
+func (fvc *FastVoteCounter) Voters() MajorityConfig {
+	return fvc.config
 }
 
 // RecordVote records a vote from a voter for an entry digest.

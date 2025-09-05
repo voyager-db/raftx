@@ -327,20 +327,17 @@ func (p *ProgressTracker) FastCommittable() uint64 {
 }
 
 // FAST RAFT: HasFastQuorum checks if the given index has fast quorum support
-func (p *ProgressTracker) HasFastQuorum(index uint64) bool {
-	if !p.EnableFastPath || index == 0 {
+func (p *ProgressTracker) HasFastQuorum(k uint64) bool {
+	if !p.EnableFastPath || k == 0 {
 		return false
 	}
-
-	old := p.Voters[0]
-	new := p.Voters[1]
+	old, new := p.Config.Voters[0], p.Config.Voters[1]
 	if len(new) == 0 {
-		need := quorum.FastQuorumSize(len(old))
-		return p.countFastAt(old, index) >= need
+		return p.countFastAt(old, k) >= quorum.FastQuorumSize(len(old))
 	}
 	needOld := quorum.FastQuorumSize(len(old))
 	needNew := quorum.FastQuorumSize(len(new))
-	return p.countFastAt(old, index) >= needOld && p.countFastAt(new, index) >= needNew
+	return p.countFastAt(old, k) >= needOld && p.countFastAt(new, k) >= needNew
 }
 
 // FAST RAFT: ResetFastMatches resets all fast match indices, typically called when

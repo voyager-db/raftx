@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/voyager-db/raftx/quorum"
 	pb "github.com/voyager-db/raftx/raftpb"
 	"github.com/voyager-db/raftx/tracker"
 )
@@ -952,19 +953,24 @@ func TestFastRaft_JointConfig_FastQuorum(t *testing.T) {
 	cfg.EnableFastPath = true
 	rn := newRaft(cfg)
 
+	// Bring up a leader.
 	rn.becomeFollower(1, None)
 	rn.becomeCandidate()
 	rn.becomeLeader()
 
-	// Fast path is gated until the leader has a commit in its term.
-	// Simulate the first-term classic commit (the no-op) so fast path is enabled.
+	// Gate: fast path only after a commit in this term (leader's no-op).
 	rn.raftLog.commitTo(rn.raftLog.lastIndex())
-	// Optional: clear any pre-existing messages before this test’s action
 	rn.msgs, rn.msgsAfterAppend = nil, nil
 
-	// Joint: old {1,2,3}, incoming {1,2,3,4,5}.
-	rn.trk.Voters[0] = map[uint64]struct{}{1: {}, 2: {}, 3: {}}
-	rn.trk.Voters[1] = map[uint64]struct{}{1: {}, 2: {}, 3: {}, 4: {}, 5: {}}
+	// ---- Install JOINT config via switchToConfig ----
+	jcfg := rn.trk.Config
+	jcfg.Voters = quorum.JointConfig{
+		quorum.MajorityConfig{1: {}, 2: {}, 3: {}},               // outgoing half
+		quorum.MajorityConfig{1: {}, 2: {}, 3: {}, 4: {}, 5: {}}, // incoming half
+	}
+	_ = rn.switchToConfig(jcfg, rn.trk.Progress)
+
+	// Ensure Progress entries exist (defensive for tests).
 	for _, id := range []uint64{1, 2, 3, 4, 5} {
 		if rn.trk.Progress[id] == nil {
 			rn.trk.Progress[id] = &tracker.Progress{
@@ -974,8 +980,10 @@ func TestFastRaft_JointConfig_FastQuorum(t *testing.T) {
 		}
 	}
 
-	// Propose; capture k,term.
-	require.NoError(t, rn.Step(pb.Message{Type: pb.MsgProp, From: 1, Entries: []pb.Entry{{Data: []byte("joint")}}}))
+	// Propose on the fast path; capture (k, term) from the outgoing MsgFastProp.
+	require.NoError(t, rn.Step(pb.Message{
+		Type: pb.MsgProp, From: 1, Entries: []pb.Entry{{Data: []byte("joint")}},
+	}))
 	var k, term uint64
 	all := append([]pb.Message{}, rn.msgs...)
 	all = append(all, rn.msgsAfterAppend...)
@@ -985,7 +993,13 @@ func TestFastRaft_JointConfig_FastQuorum(t *testing.T) {
 			break
 		}
 	}
-	require.NotZero(t, k)
+
+	t.Logf("[DBG] committed=%d, k=%d, lastIndex=%d",
+		rn.raftLog.committed, k, rn.raftLog.lastIndex())
+	require.Equal(t, rn.raftLog.committed+1, k,
+		"[DBG] first fast proposal index must be committed+1")
+
+	require.NotZero(t, k, "expected a fast proposal to be broadcast")
 	dig := entryDigest(&pb.Entry{Index: k, Term: term, Data: []byte("joint")})
 
 	// Old-half votes only: leader self + {2,3}.
@@ -993,26 +1007,28 @@ func TestFastRaft_JointConfig_FastQuorum(t *testing.T) {
 	_ = rn.Step(pb.Message{Type: pb.MsgFastVote, From: 2, To: 1, Index: k, LogTerm: term, Context: []byte(dig)})
 	_ = rn.Step(pb.Message{Type: pb.MsgFastVote, From: 3, To: 1, Index: k, LogTerm: term, Context: []byte(dig)})
 
-	// With per-half quorums, this is NOT enough (new half needs 4).
-	require.Equal(t, uint64(0), rn.trk.FastCommittable(),
-		"should not fast-commit with only the old-half votes")
+	// Not enough yet under joint-fast rules: should not be committed.
+	require.NotEqual(t, k, rn.raftLog.committed, "should not be committed with only old-half votes")
 
-	// Add one more vote from the new half (node 4) to satisfy the new-half fast quorum.
+	// Add one more vote from the new half (node 4).
 	_ = rn.Step(pb.Message{Type: pb.MsgFastVote, From: 4, To: 1, Index: k, LogTerm: term, Context: []byte(dig)})
 
-	// Now both halves satisfy their fast quorum at k.
-	require.Equal(t, k, rn.trk.FastCommittable(),
-		"should fast-commit once both halves meet fast quorum at the same k")
+	// ✅ EFFECT: leader should fast-commit k immediately inside tryDecideAt.
+	require.Equal(t, k, rn.raftLog.committed,
+		"leader should fast-commit once both halves meet fast quorum at the same k")
 
 	// Fast votes must not mutate Match (but Next may be lowered to idx).
 	matchBefore := rn.trk.Progress[2].Match
 	nextBefore := rn.trk.Progress[2].Next
 	_ = rn.Step(pb.Message{Type: pb.MsgFastVote, From: 2, To: 1, Index: k, LogTerm: term, Context: []byte(dig)})
 
-	assert.Equal(t, matchBefore, rn.trk.Progress[2].Match)
+	assert.Equal(t, matchBefore, rn.trk.Progress[2].Match,
+		"fast votes must not change Match")
 	// Next is allowed to be lowered to idx to avoid skipping the chosen write.
-	assert.LessOrEqual(t, rn.trk.Progress[2].Next, nextBefore)
-	assert.GreaterOrEqual(t, rn.trk.Progress[2].Next, rn.trk.Progress[2].Match+1)
+	assert.LessOrEqual(t, rn.trk.Progress[2].Next, nextBefore,
+		"Next may be lowered to the decided index")
+	assert.GreaterOrEqual(t, rn.trk.Progress[2].Next, rn.trk.Progress[2].Match+1,
+		"Next must remain at least Match+1")
 }
 
 func TestFastRaft_NeverOverwriteCommitted(t *testing.T) {

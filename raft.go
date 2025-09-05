@@ -491,6 +491,11 @@ type raft struct {
 	// can materialize the chosen entry when deciding.
 	fastPropStore map[uint64]map[string]pb.Entry // index -> digest -> Entry
 
+	// fastNext is the next index to assign for fast proposals. This avoids
+	// repeatedly reusing committed+1 when the commit frontier is stalled,
+	// which otherwise causes per-index digest blow-ups.
+	fastNext uint64
+
 	// ====== C-RAFT: global-tier state ======
 	enableCRaft bool
 
@@ -532,6 +537,17 @@ type raft struct {
 	gHeartbeatTimeout int
 
 	glog *globalLog
+}
+
+// clampFastNext ensures the proposal cursor is never behind the committed frontier.
+func (r *raft) clampFastNext() {
+	if !r.enableFastPath {
+		return
+	}
+	frontier := r.raftLog.committed + 1
+	if r.fastNext < frontier {
+		r.fastNext = frontier
+	}
 }
 
 func newRaft(c *Config) *raft {
@@ -745,6 +761,7 @@ func (r *raft) tryDecideAt(k uint64) {
 	term := r.raftLog.zeroTermOnOutOfBounds(r.raftLog.term(k))
 	if r.trk.HasFastQuorum(k) && term == r.Term {
 		r.raftLog.commitTo(k)
+		r.clampFastNext()
 		releasePendingReadIndexMessages(r)
 		r.bcastAppend()
 		delete(r.possibleEntries, k)
@@ -810,8 +827,16 @@ func (r *raft) broadcastFastProp(ents []pb.Entry) {
 	if !r.enableFastPath || len(ents) == 0 {
 		return
 	}
-	// Propose at the next uncommitted index (Fast Raft proposer chooses i).
-	k := r.raftLog.committed + 1
+	// Ensure the cursor is not behind the commit frontier (important if commit
+	// moved since we last advanced the cursor, e.g. tests call commitTo()).
+	r.clampFastNext()
+
+	// Propose at the leader-local cursor (monotonic across batches).
+	k := r.fastNext
+	if k == 0 { // defensive for mixed upgrades; seed lazily
+		k = r.raftLog.committed + 1
+		r.fastNext = k
+	}
 
 	if r.possibleEntries == nil {
 		r.possibleEntries = make(map[uint64]*quorum.FastVoteCounter)
@@ -861,6 +886,11 @@ func (r *raft) broadcastFastProp(ents []pb.Entry) {
 			r.send(m)
 		})
 	}
+
+	// Advance the cursor past this batch.
+	r.fastNext = k + uint64(len(ents))
+	// Keep the window tidy even if commit is stalled.
+	r.pruneFastWindow()
 }
 
 // handleFastProp processes an incoming MsgFastProp (follower side and leader self-delivery).
@@ -1382,13 +1412,18 @@ func (r *raft) maybeCommit() bool {
 			if err == nil && term == r.Term {
 				r.logger.Infof("%x fast committing via tracker to %d", r.id, fc)
 				r.raftLog.commitTo(fc)
+				r.clampFastNext()
 				return true
 			}
 		}
 	}
 
 	// Fall back to classic commit
-	return r.raftLog.maybeCommit(entryID{term: r.Term, index: r.trk.Committed()})
+	ok := r.raftLog.maybeCommit(entryID{term: r.Term, index: r.trk.Committed()})
+	if ok {
+		r.clampFastNext()
+	}
+	return ok
 }
 
 func (r *raft) reset(term uint64) {
@@ -1560,6 +1595,9 @@ func (r *raft) becomeLeader() {
 	if r.enableFastPath {
 		r.possibleEntries = make(map[uint64]*quorum.FastVoteCounter)
 		r.trk.ResetFastMatches()
+
+		// Seed the fast-proposal cursor at the uncommitted frontier.
+		r.fastNext = r.raftLog.committed + 1
 
 		if len(r.selfApprovedHints) > 0 {
 			for _, hint := range r.selfApprovedHints {

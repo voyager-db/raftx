@@ -23,8 +23,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	pb "go.etcd.io/raft/v3/raftpb"
-	"go.etcd.io/raft/v3/tracker"
+	pb "github.com/voyager-db/raftx/raftpb"
+	"github.com/voyager-db/raftx/tracker"
 )
 
 type rndConfChange pb.ConfState

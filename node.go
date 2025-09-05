@@ -18,7 +18,7 @@ import (
 	"context"
 	"errors"
 
-	pb "go.etcd.io/raft/v3/raftpb"
+	pb "github.com/voyager-db/raftx/raftpb"
 )
 
 type SnapshotStatus int
@@ -138,6 +138,13 @@ type Node interface {
 	// Propose proposes that data be appended to the log. Note that proposals can be lost without
 	// notice, therefore it is user's job to ensure proposal retries.
 	Propose(ctx context.Context, data []byte) error
+
+	// ProposeFast multicasts-style proposal *to this node* for index i.
+	// Callers should invoke this on every peer they want to participate.
+	// contentID MUST be a stable identity for the entry (see spec §2.1).
+	// Data may be nil if you rely solely on contentID equality during fast voting.
+	ProposeFast(ctx context.Context, index uint64, data, contentID, clientID []byte, requestID uint64) error
+
 	// ProposeConfChange proposes a configuration change. Like any proposal, the
 	// configuration change may be dropped with or without an error being
 	// returned. In particular, configuration changes are dropped unless the
@@ -468,6 +475,27 @@ func (n *node) Campaign(ctx context.Context) error { return n.step(ctx, pb.Messa
 
 func (n *node) Propose(ctx context.Context, data []byte) error {
 	return n.stepWait(ctx, pb.Message{Type: pb.MsgProp, Entries: []pb.Entry{{Data: data}}})
+}
+
+// ProposeFast sends a MsgFastProp into this node's raft state machine.
+// IMPORTANT: This does not multicast by itself; have your transport/RPC layer
+// call ProposeFast on each peer (including the leader) you want to receive it.
+func (n *node) ProposeFast(ctx context.Context, index uint64, data, contentID, clientID []byte, requestID uint64) error {
+	m := pb.Message{
+		Type:  pb.MsgFastProp,
+		Index: index,
+		Entries: []pb.Entry{{
+			Index:     index, // followers will set/verify
+			Type:      pb.EntryNormal,
+			Data:      data,      // optional for fast voting
+			ContentId: contentID, // REQUIRED for equality/votes
+			ClientId:  clientID,  // optional (exactly-once layer)
+			RequestId: &requestID, // optional (exactly-once layer)
+		}},
+	}
+	// Route like any other non-MsgProp (through recvc), so it is NOT gated
+	// on having a leader. This matches the spec: proposers may multicast to all members.
+	return n.step(ctx, m)
 }
 
 func (n *node) Step(ctx context.Context, m pb.Message) error {

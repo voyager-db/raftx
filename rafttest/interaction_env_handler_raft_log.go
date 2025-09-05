@@ -21,7 +21,7 @@ import (
 
 	"github.com/cockroachdb/datadriven"
 
-	"go.etcd.io/raft/v3"
+	raft "github.com/voyager-db/raftx"
 )
 
 func (env *InteractionEnv) handleRaftLog(t *testing.T, d datadriven.TestData) error {

@@ -23,8 +23,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	pb "go.etcd.io/raft/v3/raftpb"
-	"go.etcd.io/raft/v3/tracker"
+	pb "github.com/voyager-db/raftx/raftpb"
+	"github.com/voyager-db/raftx/tracker"
 )
 
 // TestConfChangeQuick uses quickcheck to verify that simple and joint config

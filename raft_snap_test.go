@@ -20,7 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	pb "go.etcd.io/raft/v3/raftpb"
+	pb "github.com/voyager-db/raftx/raftpb"
 )
 
 var (

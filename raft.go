@@ -25,10 +25,10 @@ import (
 	"strings"
 	"sync"
 
-	"go.etcd.io/raft/v3/confchange"
-	"go.etcd.io/raft/v3/quorum"
-	pb "go.etcd.io/raft/v3/raftpb"
-	"go.etcd.io/raft/v3/tracker"
+	"github.com/voyager-db/raftx/confchange"
+	"github.com/voyager-db/raftx/quorum"
+	pb "github.com/voyager-db/raftx/raftpb"
+	"github.com/voyager-db/raftx/tracker"
 )
 
 const (
@@ -286,6 +286,18 @@ type Config struct {
 
 	// raft state tracer
 	TraceLogger TraceLogger
+
+	// --- Fast Raft (experimental) ---
+	// EnableFastPath allows followers to accept self-approved proposals sent
+	// via MsgFastProp. Enabling this alone does NOT change commit behavior.
+	// Fast commit remains disabled until later milestones.
+	EnableFastPath   bool
+	EnableFastCommit bool
+
+	// FastOpenIndexWindow bounds how far ahead of commitIndex a follower will
+	// accept self-approved entries. Reasonable values are 1..4. Default 1.
+	// This is a safety/flow-control knob; it does not affect classic commit.
+	FastOpenIndexWindow int
 }
 
 func (c *Config) validate() error {
@@ -333,6 +345,11 @@ func (c *Config) validate() error {
 
 	if c.ReadOnlyOption == ReadOnlyLeaseBased && !c.CheckQuorum {
 		return errors.New("CheckQuorum must be enabled when ReadOnlyOption is ReadOnlyLeaseBased")
+	}
+
+	// --- Fast Raft defaults ---
+	if c.FastOpenIndexWindow <= 0 {
+		c.FastOpenIndexWindow = 1
 	}
 
 	return nil
@@ -432,6 +449,25 @@ type raft struct {
 	pendingReadIndexMessages []pb.Message
 
 	traceLogger TraceLogger
+
+	// --- Fast Raft knobs ---
+	enableFastPath   bool
+	enableFastCommit bool
+
+	fastOpenIndexWindow int
+	// last index in the log whose entry was leader-approved (origin=Leader)
+	lastLeaderIndex uint64
+
+	// --- Fast Raft vote aggregation (leader only) ---
+	// possibleEntries[index][contentID] = set(voterID)
+	possibleEntries map[uint64]map[string]map[uint64]struct{}
+	// fastVoterChoice[index][voterID] = contentID (for dedup/move)
+	fastVoterChoice map[uint64]map[uint64]string
+	// proposalCache[index][contentID] = entry payload (for later materialization)
+	proposalCache map[uint64]map[string]pb.Entry
+	// follower -> highest k they voted for the winner
+	fastMatchIndex map[uint64]uint64
+	electionSelf   map[uint64][]*pb.EntryRef
 }
 
 func newRaft(c *Config) *raft {
@@ -462,6 +498,9 @@ func newRaft(c *Config) *raft {
 		disableConfChangeValidation: c.DisableConfChangeValidation,
 		stepDownOnRemoval:           c.StepDownOnRemoval,
 		traceLogger:                 c.TraceLogger,
+		enableFastPath:              c.EnableFastPath,
+		enableFastCommit:            c.EnableFastCommit,
+		fastOpenIndexWindow:         c.FastOpenIndexWindow,
 	}
 
 	traceInitState(r)
@@ -489,10 +528,275 @@ func newRaft(c *Config) *raft {
 		nodesStrs = append(nodesStrs, fmt.Sprintf("%x", n))
 	}
 
+	r.recomputeLastLeaderIndex()
+
 	// TODO(pav-kv): it should be ok to simply print %+v for lastID.
 	r.logger.Infof("newRaft %x [peers: [%s], term: %d, commit: %d, applied: %d, lastindex: %d, lastterm: %d]",
 		r.id, strings.Join(nodesStrs, ","), r.Term, r.raftLog.committed, r.raftLog.applied, lastID.index, lastID.term)
 	return r
+}
+
+func getOrigin(e *pb.Entry) pb.EntryOrigin {
+	if e.Origin == nil {
+		return pb.EntryOriginUnknown
+	}
+	return *e.Origin
+}
+
+func setOrigin(e *pb.Entry, o pb.EntryOrigin) {
+	e.Origin = &o
+}
+
+func (r *raft) recomputeLastLeaderIndex() {
+	fi := r.raftLog.firstIndex()
+	li := r.raftLog.lastIndex()
+
+	// Guard: empty or nonsensical ranges from storage.
+	if fi == 0 || li == 0 || li < fi {
+		r.lastLeaderIndex = 0
+		return
+	}
+
+	i := li
+	for {
+		// Safe: i in [fi, li], so i+1 can't overflow because fi>=1.
+		ents, err := r.raftLog.slice(i, i+1, noLimit)
+		if err == nil && len(ents) == 1 {
+			orig := getOrigin(&ents[0]) // nullable-safe helper
+			// Treat Unknown (legacy) as Leader for frontier purposes.
+			if orig == pb.EntryOriginLeader || orig == pb.EntryOriginUnknown {
+				r.lastLeaderIndex = i
+				return
+			}
+		}
+
+		if i == fi {
+			break // avoid i-- underflow
+		}
+		i--
+	}
+
+	r.lastLeaderIndex = 0
+}
+
+// majority of current voters (works in joint too; uses union)
+func (r *raft) quorumThreshold() int {
+	ids := r.trk.Config.Voters.IDs()
+	return len(ids)/2 + 1
+}
+
+func (r *raft) materializeDecision(k uint64, cid string) (pb.Entry, bool) {
+	// Prefer the exact payload we cached when receiving MsgFastProp on the leader.
+	if m := r.proposalCache[k]; m != nil {
+		if e, ok := m[cid]; ok {
+			// Ensure leader-origin on install; Index/Term set by caller.
+			e.Origin = pb.EntryOriginLeader.Enum()
+			return e, true
+		}
+	}
+	// Fallback: create a header-only entry with content_id; Data empty is OK
+	// (you may want to look up the full payload from app layer).
+	return pb.Entry{
+		Type:      pb.EntryNormal,
+		Data:      nil,
+		Origin:    pb.EntryOriginLeader.Enum(),
+		ContentId: []byte(cid),
+	}, true
+}
+
+func (r *raft) nullDuplicates(cid string, keepIdx uint64) {
+	for idx, mp := range r.possibleEntries {
+		if idx == keepIdx {
+			continue
+		}
+		delete(mp, cid)
+		if len(mp) == 0 {
+			delete(r.possibleEntries, idx)
+		}
+	}
+}
+
+func (r *raft) maybeDecideAtKClassicOnly() {
+	if !r.enableFastPath || r.state != StateLeader {
+		return
+	}
+
+	k := r.raftLog.committed + 1
+	bucket := r.possibleEntries[k]
+	if bucket == nil || len(bucket) == 0 {
+		return
+	}
+
+	// argmax + deterministic tie-break on contentId (lexicographic)
+	var winnerCID string
+	var winnerCnt int
+	for cid, voters := range bucket {
+		cnt := len(voters)
+		if cnt > winnerCnt || (cnt == winnerCnt && (winnerCID == "" || cid < winnerCID)) {
+			winnerCID, winnerCnt = cid, cnt
+		}
+	}
+	if winnerCnt < r.quorumThreshold() {
+		return // not enough yet to pick a decision
+	}
+
+	// materialize entry for k
+	e, ok := r.materializeDecision(k, winnerCID)
+	if !ok {
+		return
+	}
+
+	// install decision at exactly index k (overwrite any unstable tail)
+	// (raftLog.append will truncate-and-append from k)
+	e.Index = k
+	e.Term = r.Term
+	if e.Origin == nil || *e.Origin == pb.EntryOriginUnknown {
+		e.Origin = pb.EntryOriginLeader.Enum()
+	}
+	if !r.increaseUncommittedSize([]pb.Entry{e}) {
+		return
+	}
+	r.raftLog.append(e)
+	if r.lastLeaderIndex < k {
+		r.lastLeaderIndex = k
+	}
+
+	// mark winners
+	for voter := range bucket[winnerCID] {
+		if r.fastMatchIndex[voter] < k {
+			r.fastMatchIndex[voter] = k
+		}
+	}
+
+	// content-level dedupe across other indices
+	r.nullDuplicates(winnerCID, k)
+
+	// replicate classically (regular MaybeCommit will advance when matchIndex wins)
+	r.bcastAppend()
+	_ = r.tryFastCommit(k) // safe no-op when flag off or condition not met
+
+	// optional structured log
+	r.logger.Infof("[fast] decision chosen at k=%d cid=%q votes=%d path=classic", k, winnerCID, winnerCnt)
+}
+
+func (r *raft) tryFastCommit(k uint64) bool {
+	if !r.enableFastCommit || r.state != StateLeader {
+		return false
+	}
+
+	// term guard: only current term entries may advance commitIndex
+	if r.raftLog.zeroTermOnOutOfBounds(r.raftLog.term(k)) != r.Term {
+		return false
+	}
+
+	// Count voters with fastMatchIndex >= k
+	voters := r.trk.Config.Voters.IDs()
+	have := 0
+	for id := range voters {
+		if r.fastMatchIndex[id] >= k {
+			have++
+		}
+	}
+	if have >= r.quorumThreshold() {
+		r.raftLog.commitTo(k)
+		r.logger.Infof("[fast] committed k=%d via fast path (have=%d need=%d)", k, have, r.quorumThreshold())
+		// unblock pending read-index after first commit in term
+		releasePendingReadIndexMessages(r)
+		// announce new commit
+		r.bcastAppend()
+		return true
+	}
+	return false
+}
+
+func (r *raft) seedPossibleEntriesFromElection() {
+	for voter, refs := range r.electionSelf {
+		for _, ref := range refs {
+			if ref == nil || ref.Index == nil || *ref.Index <= r.raftLog.committed {
+				continue
+			}
+			if len(ref.ContentId) == 0 {
+				continue
+			}
+			idx := *ref.Index
+			cid := string(ref.ContentId)
+
+			if r.possibleEntries[idx] == nil {
+				r.possibleEntries[idx] = make(map[string]map[uint64]struct{})
+			}
+			if r.fastVoterChoice[idx] == nil {
+				r.fastVoterChoice[idx] = make(map[uint64]string)
+			}
+			// record vote
+			set := r.possibleEntries[idx][cid]
+			if set == nil {
+				set = make(map[uint64]struct{})
+				r.possibleEntries[idx][cid] = set
+			}
+			// don't double-count voter if we saw multiple refs for same idx
+			if prev, ok := r.fastVoterChoice[idx][voter]; ok && prev != cid {
+				delete(r.possibleEntries[idx][prev], voter)
+			}
+			set[voter] = struct{}{}
+			r.fastVoterChoice[idx][voter] = cid
+		}
+	}
+	r.logger.Infof("[fast] seeded %d indices from election self-approved refs", len(r.possibleEntries))
+	// clear bag
+	r.electionSelf = nil
+}
+
+// leader-only fast state; safe to nil when not leader
+func (r *raft) clearLeaderFastState() {
+	r.possibleEntries = nil
+	r.fastVoterChoice = nil
+	r.proposalCache = nil
+	r.fastMatchIndex = nil
+}
+
+// Build a vote response (grant or reject) and attach self-approved refs.
+func (r *raft) voteRespWithSelfApproved(to uint64, term uint64, t pb.MessageType, reject bool) pb.Message {
+	msg := pb.Message{To: to, Term: term, Type: t}
+	if reject {
+		msg.Reject = true
+	}
+	if r.enableFastPath {
+		refs := r.collectSelfApprovedRefs(128) // cap to a window; tune as you like
+		if len(refs) > 0 {
+			msg.SelfApproved = refs
+		}
+	}
+	return msg
+}
+
+// Enumerate self-approved entries after commitIndex.
+func (r *raft) collectSelfApprovedRefs(limit int) []*pb.EntryRef {
+	if !r.enableFastPath {
+		return nil
+	}
+	lo := r.raftLog.committed + 1
+	hi := r.raftLog.lastIndex()
+	if hi < lo {
+		return nil
+	}
+
+	refs := make([]*pb.EntryRef, 0, min(limit, int(hi-lo+1)))
+	for i := lo; i <= hi && len(refs) < limit; i++ {
+		ents, _ := r.raftLog.slice(i, i+1, noLimit)
+		if len(ents) != 1 {
+			continue
+		}
+		if getOrigin(&ents[0]) != pb.EntryOriginSelf {
+			continue
+		}
+		idx := i // local so we can take &idx
+		refs = append(refs, &pb.EntryRef{
+			Index:     &idx,
+			ContentId: ents[0].ContentId,
+			Origin:    pb.EntryOriginSelf.Enum(),
+		})
+	}
+	return refs
 }
 
 func (r *raft) hasLeader() bool { return r.lead != None }
@@ -770,6 +1074,11 @@ func (r *raft) appliedSnap(snap *pb.Snapshot) {
 	index := snap.Metadata.Index
 	r.raftLog.stableSnapTo(index)
 	r.appliedTo(index, 0 /* size */)
+	r.recomputeLastLeaderIndex()
+	// Clamp frontier to snapshot boundary (≤ index)
+	if r.lastLeaderIndex > index {
+		r.lastLeaderIndex = index
+	}
 }
 
 // maybeCommit attempts to advance the commit index. Returns true if the commit
@@ -817,31 +1126,25 @@ func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
 	for i := range es {
 		es[i].Term = r.Term
 		es[i].Index = li + 1 + uint64(i)
+		if r.enableFastPath {
+			// default unknown (or nil) -> set when leader appends
+			if es[i].Origin == nil || *es[i].Origin == pb.EntryOriginUnknown {
+				setOrigin(&es[i], pb.EntryOriginLeader)
+			}
+		}
 	}
-	// Track the size of this uncommitted proposal.
 	if !r.increaseUncommittedSize(es) {
-		r.logger.Warningf(
-			"%x appending new entries to log would exceed uncommitted entry size limit; dropping proposal",
-			r.id,
-		)
-		// Drop the proposal.
+		r.logger.Warningf("%x appending new entries to log would exceed uncommitted entry size limit; dropping proposal", r.id)
 		return false
 	}
 
 	traceReplicate(r, es...)
 
-	// use latest "last" index after truncate/append
 	li = r.raftLog.append(es...)
-	// The leader needs to self-ack the entries just appended once they have
-	// been durably persisted (since it doesn't send an MsgApp to itself). This
-	// response message will be added to msgsAfterAppend and delivered back to
-	// this node after these entries have been written to stable storage. When
-	// handled, this is roughly equivalent to:
-	//
-	//  r.trk.Progress[r.id].MaybeUpdate(e.Index)
-	//  if r.maybeCommit() {
-	//  	r.bcastAppend()
-	//  }
+	// keep cached frontier hot when we're leader
+	if r.enableFastPath {
+		r.lastLeaderIndex = li
+	}
 	r.send(pb.Message{To: r.id, Type: pb.MsgAppResp, Index: li})
 	return true
 }
@@ -896,6 +1199,11 @@ func (r *raft) becomeFollower(term uint64, lead uint64) {
 	r.state = StateFollower
 	r.logger.Infof("%x became follower at term %d", r.id, r.Term)
 
+	if r.enableFastPath {
+		r.clearLeaderFastState()
+		r.electionSelf = nil
+	}
+
 	traceBecomeFollower(r)
 }
 
@@ -910,6 +1218,12 @@ func (r *raft) becomeCandidate() {
 	r.Vote = r.id
 	r.state = StateCandidate
 	r.logger.Infof("%x became candidate at term %d", r.id, r.Term)
+
+	if r.enableFastPath {
+		r.clearLeaderFastState()
+		// We'll (re)create electionSelf in campaign(); ensure old is gone.
+		r.electionSelf = nil
+	}
 
 	traceBecomeCandidate(r)
 }
@@ -962,6 +1276,24 @@ func (r *raft) becomeLeader() {
 	if !r.appendEntry(emptyEnt) {
 		// This won't happen because we just called reset() above.
 		r.logger.Panic("empty entry was dropped")
+	}
+
+	if r.enableFastPath {
+		r.possibleEntries = make(map[uint64]map[string]map[uint64]struct{})
+		r.fastVoterChoice = make(map[uint64]map[uint64]string)
+		r.proposalCache = make(map[uint64]map[string]pb.Entry)
+		if r.fastMatchIndex == nil {
+			r.fastMatchIndex = make(map[uint64]uint64)
+		}
+		if len(r.electionSelf) > 0 {
+			r.seedPossibleEntriesFromElection()
+			// opportunistically decide immediately if CQ is present
+			r.maybeDecideAtKClassicOnly()
+			r.electionSelf = nil
+
+		}
+	} else {
+		r.possibleEntries, r.fastVoterChoice, r.proposalCache = nil, nil, nil
 	}
 	// The payloadSize of an empty entry is 0 (see TestPayloadSizeOfEmptyEntry),
 	// so the preceding log append does not count against the uncommitted log
@@ -1040,6 +1372,10 @@ func (r *raft) campaign(t CampaignType) {
 		voteMsg = pb.MsgVote
 		term = r.Term
 	}
+
+	if r.enableFastPath {
+		r.electionSelf = make(map[uint64][]*pb.EntryRef)
+	}
 	var ids []uint64
 	{
 		idMap := r.trk.Voters.IDs()
@@ -1068,7 +1404,20 @@ func (r *raft) campaign(t CampaignType) {
 		if t == campaignTransfer {
 			ctx = []byte(t)
 		}
-		r.send(pb.Message{To: id, Term: term, Type: voteMsg, Index: last.index, LogTerm: last.term, Context: ctx})
+
+		candLLI := r.lastLeaderIndex
+		msg := pb.Message{
+			To: id, Term: term, Type: voteMsg,
+			Index: last.index, LogTerm: last.term, // classic fields (always)
+			Context: ctx, // transfer context (sometimes)
+		}
+		if r.enableFastPath && candLLI > 0 {
+			candLLT, _ := r.raftLog.term(candLLI)
+			cli, clt := candLLI, candLLT // locals so we can take addresses
+			msg.CandLastLeaderIndex = &cli
+			msg.CandLastLeaderTerm = &clt
+		}
+		r.send(msg)
 	}
 }
 
@@ -1208,10 +1557,40 @@ func (r *raft) Step(m pb.Message) error {
 			(r.Vote == None && r.lead == None) ||
 			// ...or this is a PreVote for a future term...
 			(m.Type == pb.MsgPreVote && m.Term > r.Term)
-		// ...and we believe the candidate is up to date.
+
+		// NEW: freshness by leader-approved frontier (LLI, LLT)
+		fresh := func() bool {
+			if r.enableFastPath {
+				myLLI := r.lastLeaderIndex
+				myLLT := r.raftLog.zeroTermOnOutOfBounds(r.raftLog.term(myLLI))
+
+				var candLLI, candLLT uint64
+				candHasFrontier := false
+				if m.CandLastLeaderIndex != nil && *m.CandLastLeaderIndex > 0 &&
+					m.CandLastLeaderTerm != nil && *m.CandLastLeaderTerm > 0 {
+					candLLI, candLLT = *m.CandLastLeaderIndex, *m.CandLastLeaderTerm
+					candHasFrontier = true
+				}
+
+				// Use frontier only if BOTH sides have a meaningful value.
+				if candHasFrontier && myLLI > 0 {
+					if candLLT > myLLT {
+						return true
+					}
+					if candLLT < myLLT {
+						return false
+					}
+					return candLLI >= myLLI
+				}
+			}
+
+			// Fallback: classic freshness (lastLogIndex,lastLogTerm).
+			return r.raftLog.isUpToDate(entryID{term: m.LogTerm, index: m.Index})
+		}()
+
 		lastID := r.raftLog.lastEntryID()
 		candLastID := entryID{term: m.LogTerm, index: m.Index}
-		if canVote && r.raftLog.isUpToDate(candLastID) {
+		if canVote && fresh {
 			// Note: it turns out that that learners must be allowed to cast votes.
 			// This seems counter- intuitive but is necessary in the situation in which
 			// a learner has been promoted (i.e. is now a voter) but has not learned
@@ -1241,7 +1620,7 @@ func (r *raft) Step(m pb.Message) error {
 			// the message (it ignores all out of date messages).
 			// The term in the original message and current local term are the
 			// same in the case of regular votes, but different for pre-votes.
-			r.send(pb.Message{To: m.From, Term: m.Term, Type: voteRespMsgType(m.Type)})
+			r.send(r.voteRespWithSelfApproved(m.From, m.Term, voteRespMsgType(m.Type), false))
 			if m.Type == pb.MsgVote {
 				// Only record real votes.
 				r.electionElapsed = 0
@@ -1250,7 +1629,7 @@ func (r *raft) Step(m pb.Message) error {
 		} else {
 			r.logger.Infof("%x [logterm: %d, index: %d, vote: %x] rejected %s from %x [logterm: %d, index: %d] at term %d",
 				r.id, lastID.term, lastID.index, r.Vote, m.Type, m.From, candLastID.term, candLastID.index, r.Term)
-			r.send(pb.Message{To: m.From, Term: r.Term, Type: voteRespMsgType(m.Type), Reject: true})
+			r.send(r.voteRespWithSelfApproved(m.From, r.Term, voteRespMsgType(m.Type), true))
 		}
 
 	default:
@@ -1260,6 +1639,19 @@ func (r *raft) Step(m pb.Message) error {
 		}
 	}
 	return nil
+}
+
+// safe check: do we already have a leader-approved entry at idx?
+func (r *raft) hasLeaderApprovedAt(idx uint64) bool {
+	if idx == 0 || idx > r.raftLog.lastIndex() {
+		return false
+	}
+	ents, err := r.raftLog.slice(idx, idx+1, noLimit)
+	if err != nil || len(ents) != 1 {
+		return false
+	}
+	orig := getOrigin(&ents[0])
+	return orig == pb.EntryOriginLeader || orig == pb.EntryOriginUnknown
 }
 
 type stepFunc func(r *raft, m pb.Message) error
@@ -1364,6 +1756,99 @@ func stepLeader(r *raft, m pb.Message) error {
 		return nil
 	case pb.MsgForgetLeader:
 		return nil // noop on leader
+	case pb.MsgFastProp:
+		if !r.enableFastPath {
+			return nil
+		}
+		if m.Index == 0 || len(m.Entries) == 0 {
+			return nil
+		}
+		e := m.Entries[0]
+		cid := string(e.ContentId)
+		if cid == "" {
+			return nil
+		}
+		bucket := r.proposalCache[m.Index]
+		if bucket == nil {
+			bucket = make(map[string]pb.Entry)
+			r.proposalCache[m.Index] = bucket
+		}
+		// Keep first payload we see for this (index,cid); ignore later duplicates.
+		if _, ok := bucket[cid]; !ok {
+			bucket[cid] = e
+		}
+
+		// classic-fallback when mixed cluster can't produce fast-vote CQ.
+		// If this is the next index k and we haven't installed a leader-approved entry yet,
+		// pick this payload and replicate classically. First-wins policy is fine.
+		k := r.raftLog.committed + 1
+		if m.Index == k && !r.hasLeaderApprovedAt(k) {
+			// Materialize leader-approved entry from the cached payload.
+			chosen := bucket[cid]
+			setOrigin(&chosen, pb.EntryOriginLeader) // leader canon
+			chosen.Index = 0                         // appendEntry sets Index/Term
+			chosen.Term = 0
+
+			if r.appendEntry(chosen) {
+				// We’ve chosen; clear fast buckets at k (no more voting at k).
+				delete(r.possibleEntries, k)
+				delete(r.fastVoterChoice, k)
+				// Count ourselves toward any later fast-commit checks (harmless).
+				if r.fastMatchIndex[r.id] < k {
+					r.fastMatchIndex[r.id] = k
+				}
+				r.bcastAppend() // classic replication
+			}
+		}
+		return nil
+	case pb.MsgFastVote:
+		if !r.enableFastPath {
+			return nil
+		}
+		for _, ref := range m.FastVotes {
+			if ref == nil || ref.Index == nil {
+				continue
+			}
+			idx := *ref.Index
+			if idx == 0 || idx <= r.raftLog.committed {
+				continue
+			}
+			if len(ref.ContentId) == 0 {
+				continue
+			}
+			cid := string(ref.ContentId)
+
+			if r.possibleEntries[idx] == nil {
+				r.possibleEntries[idx] = make(map[string]map[uint64]struct{})
+			}
+			if r.fastVoterChoice[idx] == nil {
+				r.fastVoterChoice[idx] = make(map[uint64]string)
+			}
+
+			voter := m.From
+			if prev, ok := r.fastVoterChoice[idx][voter]; ok && prev != cid {
+				if set := r.possibleEntries[idx][prev]; set != nil {
+					delete(set, voter)
+					if len(set) == 0 {
+						delete(r.possibleEntries[idx], prev)
+					}
+				}
+			}
+			set := r.possibleEntries[idx][cid]
+			if set == nil {
+				set = make(map[uint64]struct{})
+				r.possibleEntries[idx][cid] = set
+			}
+			set[voter] = struct{}{}
+			r.fastVoterChoice[idx][voter] = cid
+
+			// Optional: read follower's view of commit, if you care.
+			// var followerCommit uint64
+			// if m.LocalCommit != nil { followerCommit = *m.LocalCommit }
+			r.maybeDecideAtKClassicOnly()
+		}
+		return nil
+
 	}
 
 	// All other message types require a progress for m.From (pr).
@@ -1689,6 +2174,9 @@ func stepCandidate(r *raft, m pb.Message) error {
 		r.becomeFollower(m.Term, m.From) // always m.Term == r.Term
 		r.handleSnapshot(m)
 	case myVoteRespType:
+		if r.enableFastPath && len(m.SelfApproved) > 0 {
+			r.electionSelf[m.From] = append([]*pb.EntryRef(nil), m.SelfApproved...)
+		}
 		gr, rj, res := r.poll(m.From, m.Type, !m.Reject)
 		r.logger.Infof("%x has received %d %s votes and %d vote rejections", r.id, gr, m.Type, rj)
 		switch res {
@@ -1769,6 +2257,53 @@ func stepFollower(r *raft, m pb.Message) error {
 			return nil
 		}
 		r.readStates = append(r.readStates, ReadState{Index: m.Index, RequestCtx: m.Entries[0].Data})
+	case pb.MsgFastProp:
+		if !r.enableFastPath {
+			return nil
+		}
+		// Basic guards
+		if m.Index == 0 || len(m.Entries) == 0 || len(m.Entries[0].ContentId) == 0 {
+			return nil
+		}
+
+		// Window: [commit+1 .. commit+window]
+		win := r.fastOpenIndexWindow
+		if win <= 0 {
+			win = 1
+		}
+		if m.Index > r.raftLog.committed+uint64(win) {
+			// Out of window; don't append, but DO NOT send a vote either.
+			// (Leader can't decide an out-of-window index.)
+			return nil
+		}
+
+		// Already committed? Nothing to do.
+		if m.Index <= r.raftLog.committed {
+			// Best-effort: no vote either; the index is already decided.
+			return nil
+		}
+
+		// Contiguous acceptance: only append at lastIndex+1.
+		li := r.raftLog.lastIndex()
+		if m.Index == li+1 {
+			// append a self-approved placeholder
+			src := m.Entries[0]
+			e := pb.Entry{
+				Index:     m.Index,
+				Term:      0, // speculative
+				Type:      src.Type,
+				Data:      src.Data,
+				Origin:    pb.EntryOriginSelf.Enum(),
+				ContentId: src.ContentId,
+				ClientId:  src.ClientId,
+				RequestId: src.RequestId,
+			}
+			r.raftLog.append(e)
+		}
+		// IMPORTANT: even if we did not append (gap or existing), still try to send a vote
+		// so the leader learns about our preference.
+		r.sendFastVoteForIndex(m)
+		return nil
 	}
 	return nil
 }
@@ -1788,11 +2323,34 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 	// message, and validate it before taking any action (e.g. bumping term).
 	a := logSliceFromMsgApp(&m)
 
+	if r.enableFastPath {
+		for i := range a.entries {
+			if getOrigin(&a.entries[i]) == pb.EntryOriginUnknown {
+				setOrigin(&a.entries[i], pb.EntryOriginLeader)
+			}
+		}
+	}
+
 	if a.prev.index < r.raftLog.committed {
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
 		return
 	}
 	if mlastIndex, ok := r.raftLog.maybeAppend(a, m.Commit); ok {
+		if r.enableFastPath && mlastIndex > r.lastLeaderIndex {
+			from := m.Index + 1
+			to := mlastIndex
+			// We only need the highest Leader origin; scan backwards and stop at first match.
+			for i := to; i >= from && i > r.lastLeaderIndex; i-- {
+				ents, _ := r.raftLog.slice(i, i+1, noLimit)
+				if len(ents) == 1 && (ents[0].Origin == pb.EntryOriginLeader.Enum() || ents[0].Origin == pb.EntryOriginUnknown.Enum()) {
+					r.lastLeaderIndex = i
+					break
+				}
+				if i == 0 {
+					break
+				} // guard underflow
+			}
+		}
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: mlastIndex})
 		return
 	}
@@ -1934,6 +2492,11 @@ func (r *raft) restore(s pb.Snapshot) bool {
 	last := r.raftLog.lastEntryID()
 	r.logger.Infof("%x [commit: %d, lastindex: %d, lastterm: %d] restored snapshot [index: %d, term: %d]",
 		r.id, r.raftLog.committed, last.index, last.term, id.index, id.term)
+
+	r.recomputeLastLeaderIndex()
+	if r.lastLeaderIndex > s.Metadata.Index {
+		r.lastLeaderIndex = s.Metadata.Index
+	}
 	return true
 }
 
@@ -2056,6 +2619,32 @@ func (r *raft) sendTimeoutNow(to uint64) {
 
 func (r *raft) abortLeaderTransfer() {
 	r.leadTransferee = None
+}
+
+// follower helper called after self-insert
+func (r *raft) sendFastVoteForIndex(m pb.Message) {
+	fmt.Printf("sendFastVoteForIndex: enableFastPath=%v lead=%d len(m.Entries)=%d\n", r.enableFastPath, r.lead, len(m.Entries))
+	if !r.enableFastPath || r.lead == None || len(m.Entries) == 0 {
+		return
+	}
+	cid := m.Entries[0].ContentId
+	if len(cid) == 0 {
+		return
+	}
+
+	// EntryRef.Index is *uint64 in your generated code — pass a pointer.
+	idx := m.Index // local variable so &idx is stable
+	ref := &pb.EntryRef{Index: &idx, ContentId: cid}
+
+	// LocalCommit is *uint64 in your generated code — pass a pointer.
+	lc := r.raftLog.committed
+
+	r.send(pb.Message{
+		To:          r.lead,
+		Type:        pb.MsgFastVote,
+		FastVotes:   []*pb.EntryRef{ref},
+		LocalCommit: &lc,
+	})
 }
 
 // committedEntryInCurrentTerm return true if the peer has committed an entry in its term.

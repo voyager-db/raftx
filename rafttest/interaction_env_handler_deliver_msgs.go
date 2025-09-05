@@ -21,8 +21,8 @@ import (
 
 	"github.com/cockroachdb/datadriven"
 
-	"go.etcd.io/raft/v3"
-	"go.etcd.io/raft/v3/raftpb"
+	raft "github.com/voyager-db/raftx"
+	"github.com/voyager-db/raftx/raftpb"
 )
 
 func (env *InteractionEnv) handleDeliverMsgs(t *testing.T, d datadriven.TestData) error {

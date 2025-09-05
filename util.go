@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"strings"
 
-	pb "go.etcd.io/raft/v3/raftpb"
+	pb "github.com/voyager-db/raftx/raftpb"
 )
 
 func (st StateType) MarshalJSON() ([]byte, error) {
@@ -36,6 +36,9 @@ var isLocalMsg = [...]bool{
 	pb.MsgStorageAppendResp: true,
 	pb.MsgStorageApply:      true,
 	pb.MsgStorageApplyResp:  true,
+
+	pb.MsgFastProp: false,
+	pb.MsgFastVote: false,
 }
 
 var isResponseMsg = [...]bool{
@@ -47,6 +50,9 @@ var isResponseMsg = [...]bool{
 	pb.MsgPreVoteResp:       true,
 	pb.MsgStorageAppendResp: true,
 	pb.MsgStorageApplyResp:  true,
+
+	pb.MsgFastProp: false,
+	pb.MsgFastVote: false,
 }
 
 func isMsgInArray(msgt pb.MessageType, arr []bool) bool {

@@ -4,7 +4,6 @@
 # Run from repository root directory named etcd.
 #
 set -e
-shopt -s globstar
 
 if ! [[ "$0" =~ scripts/genproto.sh ]]; then
   echo "must be run from repository root"
@@ -35,14 +34,14 @@ log_callout -e "\\nRunning gofast (gogo) proto generation..."
 for dir in ${DIRS}; do
   pushd "${dir}"
     protoc --gofast_out=. -I=".:${GOGOPROTO_PATH}:${RAFT_ROOT_DIR}/..:${RAFT_ROOT_DIR}" \
-      --plugin="${GOFAST_BIN}" ./**/*.proto
+      --plugin="${GOFAST_BIN}" *.proto
 
-    sed -i.bak -E 's|"raft/raftpb"|"go.etcd.io/etcd/raft/v3/raftpb"|g' ./**/*.pb.go
-    sed -i.bak -E 's|"google/protobuf"|"github.com/gogo/protobuf/protoc-gen-gogo/descriptor"|g' ./**/*.pb.go
+    sed -i.bak -E 's|"raft/raftpb"|"go.etcd.io/etcd/raft/v3/raftpb"|g' *.pb.go
+    sed -i.bak -E 's|"google/protobuf"|"github.com/gogo/protobuf/protoc-gen-gogo/descriptor"|g' *.pb.go
 
-    rm -f ./**/*.bak
-    gofmt -s -w ./**/*.pb.go
-    run_go_tool "golang.org/x/tools/cmd/goimports" -w ./**/*.pb.go
+    rm -f *.bak
+    gofmt -s -w *.pb.go
+    run_go_tool "golang.org/x/tools/cmd/goimports" -w *.pb.go
   popd
 done
 

@@ -23,9 +23,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"go.etcd.io/raft/v3/quorum"
-	pb "go.etcd.io/raft/v3/raftpb"
-	"go.etcd.io/raft/v3/tracker"
+	"github.com/voyager-db/raftx/quorum"
+	pb "github.com/voyager-db/raftx/raftpb"
+	"github.com/voyager-db/raftx/tracker"
 )
 
 // rawNodeAdapter is essentially a lint that makes sure that RawNode implements
@@ -69,6 +69,9 @@ func (a *rawNodeAdapter) ReadIndex(_ context.Context, rctx []byte) error {
 func (a *rawNodeAdapter) Step(_ context.Context, m pb.Message) error { return a.RawNode.Step(m) }
 func (a *rawNodeAdapter) Propose(_ context.Context, data []byte) error {
 	return a.RawNode.Propose(data)
+}
+func (a *rawNodeAdapter) ProposeFast(_ context.Context, _ uint64, _ []byte, _ []byte, _ []byte, _ uint64) error {
+	return nil
 }
 func (a *rawNodeAdapter) ProposeConfChange(_ context.Context, cc pb.ConfChangeI) error {
 	return a.RawNode.ProposeConfChange(cc)

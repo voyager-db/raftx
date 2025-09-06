@@ -320,3 +320,92 @@ func TestLeaderFastPropFallbackInstallsLeaderPayloadAndClearsCache(t *testing.T)
 		t.Fatalf("log at k=%d not leader-approved payload: %+v", k, ents)
 	}
 }
+
+func TestLeaderCachesAtLeaderK_IgnoresMsgIndex(t *testing.T) {
+	cfg := baseConfigFast(1) // or your helper
+	rl := newRaft(cfg)
+
+	primeSingleVoter(rl, rl.id)
+	rl.becomeCandidate()
+	rl.becomeLeader()
+	mustAppendCommitted(rl, 3) // committed = 3
+
+	// Send a fast-prop from a non-leader sender; leader caches but does not fallback.
+	msg := pb.Message{
+		Type:  pb.MsgFastProp,
+		From:  2,   // not the leader
+		Index: 999, // ignored by leader
+		Entries: []pb.Entry{{
+			Type:      pb.EntryNormal,
+			Data:      []byte("payload-A"),
+			ContentId: []byte("cid-A"),
+		}},
+	}
+	if err := rl.Step(msg); err != nil {
+		t.Fatalf("leader step: %v", err)
+	}
+
+	k := rl.raftLog.committed + 1 // leader buckets at current k
+	bucket := rl.proposalCache[k]
+	if bucket == nil {
+		t.Fatalf("cache bucket missing at k=%d", k)
+	}
+	e, ok := bucket["cid-A"]
+	if !ok || string(e.Data) != "payload-A" {
+		t.Fatalf("cache miss or wrong payload: ok=%v data=%q", ok, e.Data)
+	}
+}
+
+func TestLeaderFallback_InstallsLeaderPayload_AndClearsCache(t *testing.T) {
+	cfg := baseConfigFast(1)
+	rl := newRaft(cfg)
+
+	primeSingleVoter(rl, rl.id)
+	rl.becomeCandidate()
+	rl.becomeLeader()
+	mustAppendCommitted(rl, 5) // committed = 5, so k=6
+
+	// Pre-arrival non-leader proposal to simulate concurrent traffic
+	nonLeader := pb.Message{
+		Type:  pb.MsgFastProp,
+		From:  2, // follower
+		Index: 0, // ignored by leader now
+		Entries: []pb.Entry{{
+			Type:      pb.EntryNormal,
+			Data:      []byte("follower-payload"),
+			ContentId: []byte("cid-X"),
+		}},
+	}
+	if err := rl.Step(nonLeader); err != nil {
+		t.Fatalf("leader step (non-leader): %v", err)
+	}
+
+	// Pre-cache leader payload (what etcd does immediately after ProposeFast).
+	rl.CacheLeaderFastPayload([]byte("leader-payload"), []byte("cid-X"))
+
+	// Now send leader’s own fast-prop; fallback should install at k and clear cache.
+	self := pb.Message{
+		Type:  pb.MsgFastProp,
+		From:  None, // local self-prop; normalized to r.id
+		Index: 0,
+		Entries: []pb.Entry{{
+			Type:      pb.EntryNormal,
+			Data:      []byte("leader-payload"), // same logical content
+			ContentId: []byte("cid-X"),
+		}},
+	}
+	if err := rl.Step(self); err != nil {
+		t.Fatalf("leader step (self): %v", err)
+	}
+
+	k := rl.raftLog.lastIndex() // single-node: append advances lastIndex == k
+	// Cache should be cleared after installing leader-approved decision
+	if rl.proposalCache[k] != nil {
+		t.Fatalf("expected proposalCache[%d] to be cleared", k)
+	}
+	// Log[k] must be the leader payload
+	ents, _ := rl.raftLog.slice(k, k+1, noLimit)
+	if len(ents) != 1 || string(ents[0].Data) != "leader-payload" || getOrigin(&ents[0]) != pb.EntryOriginLeader {
+		t.Fatalf("log at k=%d not leader-approved payload: %+v", k, ents)
+	}
+}

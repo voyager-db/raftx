@@ -552,6 +552,29 @@ func setOrigin(e *pb.Entry, o pb.EntryOrigin) {
 	e.Origin = &o
 }
 
+// CacheLeaderFastPayload pre-loads the leader's payload for the current k into proposalCache.
+// It’s safe to call only when this node is the leader and fast path is enabled.
+func (r *raft) CacheLeaderFastPayload(data, cid []byte) {
+	if !r.enableFastPath || r.state != StateLeader {
+		return
+	}
+	k := r.raftLog.committed + 1 // leader-stamped k
+	if r.proposalCache == nil {
+		r.proposalCache = make(map[uint64]map[string]pb.Entry)
+	}
+	bucket := r.proposalCache[k]
+	if bucket == nil {
+		bucket = make(map[string]pb.Entry)
+		r.proposalCache[k] = bucket
+	}
+	bucket[string(cid)] = pb.Entry{
+		Type:      pb.EntryNormal,
+		Data:      data,
+		ContentId: cid,
+		Origin:    pb.EntryOriginLeader.Enum(),
+	}
+}
+
 func (r *raft) recomputeLastLeaderIndex() {
 	fi := r.raftLog.firstIndex()
 	li := r.raftLog.lastIndex()

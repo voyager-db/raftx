@@ -591,22 +591,16 @@ func (r *raft) quorumThreshold() int {
 }
 
 func (r *raft) materializeDecision(k uint64, cid string) (pb.Entry, bool) {
-	// Prefer the exact payload we cached when receiving MsgFastProp on the leader.
 	if m := r.proposalCache[k]; m != nil {
 		if e, ok := m[cid]; ok {
 			// Ensure leader-origin on install; Index/Term set by caller.
 			e.Origin = pb.EntryOriginLeader.Enum()
+			e.Index, e.Term = 0, 0
 			return e, true
 		}
 	}
-	// Fallback: create a header-only entry with content_id; Data empty is OK
-	// (you may want to look up the full payload from app layer).
-	return pb.Entry{
-		Type:      pb.EntryNormal,
-		Data:      nil,
-		Origin:    pb.EntryOriginLeader.Enum(),
-		ContentId: []byte(cid),
-	}, true
+	// No payload yet — do NOT synthesize an empty entry.
+	return pb.Entry{}, false
 }
 
 func (r *raft) nullDuplicates(cid string, keepIdx uint64) {
@@ -1793,9 +1787,13 @@ func stepLeader(r *raft, m pb.Message) error {
 			bucket = make(map[string]pb.Entry)
 			r.proposalCache[m.Index] = bucket
 		}
-		// Keep first payload we see for this (index,cid); ignore later duplicates.
-		if _, ok := bucket[cid]; !ok {
+		// Leader-preferred caching: our own payload must win to preserve Header.ID.
+		if m.From == r.id {
 			bucket[cid] = e
+		} else {
+			if _, ok := bucket[cid]; !ok {
+				bucket[cid] = e
+			}
 		}
 
 		// classic-fallback when mixed cluster can't produce fast-vote CQ.

@@ -2312,35 +2312,36 @@ func stepFollower(r *raft, m pb.Message) error {
 		if !r.enableFastPath {
 			return nil
 		}
-		// Basic guards
-		if m.Index == 0 || len(m.Entries) == 0 || len(m.Entries[0].ContentId) == 0 {
+		// Need an entry with a content id.
+		if len(m.Entries) == 0 || len(m.Entries[0].ContentId) == 0 {
 			return nil
 		}
+
+		// Normalize to our current k; followers ignore m.Index (leader stamps k).
+		idx := r.raftLog.committed + 1
 
 		// Window: [commit+1 .. commit+window]
 		win := r.fastOpenIndexWindow
 		if win <= 0 {
 			win = 1
 		}
-		if m.Index > r.raftLog.committed+uint64(win) {
-			// Out of window; don't append, but DO NOT send a vote either.
-			// (Leader can't decide an out-of-window index.)
+		if idx > r.raftLog.committed+uint64(win) {
+			// Out of window; don't append or vote.
 			return nil
 		}
 
-		// Already committed? Nothing to do.
-		if m.Index <= r.raftLog.committed {
-			// Best-effort: no vote either; the index is already decided.
+		// Already decided/committed? Nothing to do (and no vote).
+		if idx <= r.raftLog.committed {
 			return nil
 		}
 
 		// Contiguous acceptance: only append at lastIndex+1.
 		li := r.raftLog.lastIndex()
-		if m.Index == li+1 {
-			// append a self-approved placeholder
+		if idx == li+1 {
+			// Append a self-approved placeholder.
 			src := m.Entries[0]
 			e := pb.Entry{
-				Index:     m.Index,
+				Index:     idx,
 				Term:      0, // speculative
 				Type:      src.Type,
 				Data:      src.Data,
@@ -2351,8 +2352,9 @@ func stepFollower(r *raft, m pb.Message) error {
 			}
 			r.raftLog.append(e)
 		}
-		// IMPORTANT: even if we did not append (gap or existing), still try to send a vote
-		// so the leader learns about our preference.
+
+		// Vote once per (idx,cid). Ensure the vote targets our normalized idx.
+		m.Index = idx
 		r.sendFastVoteForIndex(m)
 		return nil
 	}

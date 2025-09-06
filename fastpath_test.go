@@ -97,24 +97,50 @@ func TestFollowerSelfInsertWithinWindow(t *testing.T) {
 	}
 }
 
-func TestFollowerIgnoresOutOfWindowProposals(t *testing.T) {
-	r := newRaft(baseConfigFast(2))
-	r.becomeFollower(1, None)
-	mustAppendCommitted(r, 5)
-	idx := r.raftLog.committed + uint64(r.fastOpenIndexWindow) + 1
+func TestFollowerNormalizesIndexAndAppendsOnlyIfContiguous(t *testing.T) {
+	cfg := baseConfigFast(2)
+	cfg.EnableFastPath = true
+	r := newRaft(cfg)
+
+	// Follower that knows there's a leader, with some committed prefix.
+	r.becomeFollower(1, 1)
+	mustAppendCommitted(r, 5) // committed = 5, so follower's k = 6
+
+	// Make the log non-contiguous wrt k: lastIndex != k-1
+	// Append two speculative entries so li+1 != k.
+	r.raftLog.append(pb.Entry{Index: 6, Term: 0, Type: pb.EntryNormal})
+	r.raftLog.append(pb.Entry{Index: 7, Term: 0, Type: pb.EntryNormal})
+	// Now committed=5, k=6, but li=7 (so idx==6 != li+1==8) → follower must NOT append.
+
 	m := pb.Message{
 		Type:  pb.MsgFastProp,
-		Index: idx,
+		From:  1,     // simulate leader broadcast
+		Index: 10000, // ignored by follower
 		Entries: []pb.Entry{{
 			Type:      pb.EntryNormal,
 			ContentId: []byte("cid-out"),
+			Data:      []byte("x"),
 		}},
 	}
+	liBefore := r.raftLog.lastIndex()
 	if err := r.Step(m); err != nil {
 		t.Fatalf("step: %v", err)
 	}
-	if r.raftLog.lastIndex() != r.raftLog.committed {
-		t.Fatalf("out-of-window fast-prop was appended")
+	liAfter := r.raftLog.lastIndex()
+	if liAfter != liBefore {
+		t.Fatalf("follower appended but should not (li before %d after %d)", liBefore, liAfter)
+	}
+
+	// It should still send a vote to the leader for its normalized k (= 6).
+	found := false
+	for _, msg := range r.msgs {
+		if msg.Type == pb.MsgFastVote && msg.To == r.lead {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("follower did not send MsgFastVote")
 	}
 }
 
@@ -138,27 +164,40 @@ func TestFollowerDoesNotOverwriteOnFastProp(t *testing.T) {
 }
 
 // ---------- Milestone 4: vote plumbing & aggregation ----------
+func setVoters(r *raft, ids ...uint64) {
+	// Rebuild the tracker with a fresh config (minimal helper for tests).
+	r.trk = tracker.MakeProgressTracker(r.trk.MaxInflight, r.trk.MaxInflightBytes)
+	for _, id := range ids {
+		r.trk.Config.Voters[0][id] = struct{}{}
+		r.trk.Progress[id] = &tracker.Progress{}
+	}
+}
 
 func TestFollowerSendsFastVoteToLeaderAndLeaderTallies(t *testing.T) {
 	// Leader (1)
-	rl := newRaft(baseConfigFast(1))
-	primeSingleVoter(rl, rl.id)
+	cfgL := baseConfigFast(1)
+	rl := newRaft(cfgL)
+	setVoters(rl, 1, 2)
+
+	// Make 1 leader with some committed prefix.
 	rl.becomeCandidate()
 	rl.becomeLeader()
-	mustAppendCommitted(rl, 5)
+	mustAppendCommitted(rl, 5) // committed=5, so leader k=6
 
-	// Follower (2) that knows its leader
-	rf := newRaft(baseConfigFast(2))
+	// Follower (2) that knows its leader and has the same committed prefix.
+	cfgF := baseConfigFast(2)
+	cfgF.EnableFastPath = true
+	rf := newRaft(cfgF)
+	setVoters(rf, 1, 2)
 	rf.becomeFollower(rl.Term, rl.id)
-	rf.lead = rl.id // make sure leader is set
+	rf.lead = rl.id
 	mustAppendCommitted(rf, 5)
 
-	idx := rl.raftLog.committed + 1
-
-	// Follower accepts fast prop and emits a vote to the leader
+	// Build a fast proposal broadcast to the follower (index ignored now).
 	prop := pb.Message{
 		Type:  pb.MsgFastProp,
-		Index: idx,
+		From:  rl.id, // simulate leader broadcast
+		Index: 0,     // ignored by follower; it will vote at its own k
 		Entries: []pb.Entry{{
 			Type:      pb.EntryNormal,
 			Data:      []byte("v1"),
@@ -169,7 +208,7 @@ func TestFollowerSendsFastVoteToLeaderAndLeaderTallies(t *testing.T) {
 		t.Fatalf("follower step: %v", err)
 	}
 
-	// Deliver the vote to the leader (search both queues)
+	// Collect the vote emitted by the follower.
 	var vote pb.Message
 	found := false
 	for _, msg := range rf.msgs {
@@ -194,20 +233,24 @@ func TestFollowerSendsFastVoteToLeaderAndLeaderTallies(t *testing.T) {
 	if vote.To != rl.id {
 		t.Fatalf("vote sent to %d want %d", vote.To, rl.id)
 	}
-	if len(vote.FastVotes) != 1 || vote.FastVotes[0] == nil || vote.FastVotes[0].Index == nil || *vote.FastVotes[0].Index != idx {
+	// We no longer require ref.Index to be set; leader ignores it.
+	if len(vote.FastVotes) != 1 || vote.FastVotes[0] == nil || string(vote.FastVotes[0].ContentId) != "cid-v1" {
 		t.Fatalf("vote content bad: %#v", vote.FastVotes)
 	}
+
+	// Deliver vote to the leader.
 	if err := rl.Step(vote); err != nil {
 		t.Fatalf("leader step: %v", err)
 	}
 
-	// Verify leader tallied the vote at idx for cid-v1
-	if rl.possibleEntries == nil || rl.possibleEntries[idx] == nil {
-		t.Fatalf("no tally bucket for index %d", idx)
+	// Leader tallies at its own k (= committed+1), not at the follower's idx.
+	k := rl.raftLog.committed + 1
+	if rl.possibleEntries == nil || rl.possibleEntries[k] == nil {
+		t.Fatalf("no tally bucket for leader k=%d", k)
 	}
-	set, ok := rl.possibleEntries[idx]["cid-v1"]
+	set, ok := rl.possibleEntries[k]["cid-v1"]
 	if !ok || len(set) != 1 {
-		t.Fatalf("unexpected tally for cid-v1: %#v", rl.possibleEntries[idx])
+		t.Fatalf("unexpected tally at k=%d for cid-v1: %#v", k, rl.possibleEntries[k])
 	}
 }
 

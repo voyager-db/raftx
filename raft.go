@@ -575,6 +575,23 @@ func (r *raft) CacheLeaderFastPayload(data, cid []byte) {
 	}
 }
 
+func (r *raft) leaderEntryAtKIsNoop(k uint64) bool {
+	if k == 0 || k > r.raftLog.lastIndex() {
+		return false
+	}
+	ents, err := r.raftLog.slice(k, k+1, noLimit)
+	if err != nil || len(ents) != 1 {
+		return false
+	}
+	e := ents[0]
+	// leader-origin (or legacy ‘Unknown’ treated as leader-origin)
+	if getOrigin(&e) != pb.EntryOriginLeader && getOrigin(&e) != pb.EntryOriginUnknown {
+		return false
+	}
+	// a true noop/placeholder: no Data and no ContentId
+	return len(e.Data) == 0 && len(e.ContentId) == 0
+}
+
 func (r *raft) recomputeLastLeaderIndex() {
 	fi := r.raftLog.firstIndex()
 	li := r.raftLog.lastIndex()
@@ -1832,8 +1849,7 @@ func stepLeader(r *raft, m pb.Message) error {
 		}
 
 		// Classic fallback only on OUR own fast-prop for k.
-		if from == r.id && !r.hasLeaderApprovedAt(k) {
-			// Materialize leader-approved entry from the cached payload.
+		if from == r.id && (!r.hasLeaderApprovedAt(k) || r.leaderEntryAtKIsNoop(k)) {			// Materialize leader-approved entry from the cached payload.
 			chosen := bucket[cid]
 			setOrigin(&chosen, pb.EntryOriginLeader) // leader canon
 			chosen.Index = 0                         // appendEntry sets Index/Term

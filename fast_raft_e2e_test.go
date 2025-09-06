@@ -1040,3 +1040,87 @@ func TestE2E_Reconfig_RemoveNode_Contention_QuorumsSwitchAfterApply(t *testing.T
 		t.Fatalf("data did not commit with 2/3 after remove(4) applied")
 	}
 }
+
+func TestLeaderFallbackRunsWhenKHasUncommittedLeaderNoop(t *testing.T) {
+	// Build a single-node leader with fast path on.
+	cfg := baseConfigFast(1) // or baseConfigFast if you have it
+	cfg.EnableFastPath = true
+	rl := newRaft(cfg)
+	primeSingleVoter(rl, rl.id)
+
+	rl.becomeCandidate()
+	rl.becomeLeader()
+
+	// Build a committed prefix: committed = 5
+	mustAppendCommitted(rl, 5)
+
+	// Now append a leader-approved noop at k = committed+1 (index 6).
+	// This simulates the upstream leader's noop at term start.
+	if !rl.appendEntry(pb.Entry{Data: nil}) {
+		t.Fatalf("append noop failed")
+	}
+	noopIdx := rl.raftLog.lastIndex() // should be 6
+	if noopIdx != rl.raftLog.committed+1 {
+		t.Fatalf("noop not at k; noopIdx=%d committed=%d", noopIdx, rl.raftLog.committed)
+	}
+	// Sanity: hasLeaderApprovedAt(k) should be true for the noop.
+	if !rl.hasLeaderApprovedAt(noopIdx) {
+		t.Fatalf("expected leader-approved noop at k=%d", noopIdx)
+	}
+
+	// Pre-cache the leader payload at leader's current k so the decision
+	// will use *our* bytes (important for etcd waiter).
+	rl.CacheLeaderFastPayload([]byte("leader-payload"), []byte("cid-x"))
+
+	// Record state before attempting fallback.
+	lastIdxBefore := rl.raftLog.lastIndex()
+
+	// Send the leader's own fast-prop (From=None → normalized to leader).
+	msg := pb.Message{
+		Type:  pb.MsgFastProp,
+		From:  None, // local
+		Index: 0,    // ignored by leader
+		Entries: []pb.Entry{{
+			Type:      pb.EntryNormal,
+			Data:      []byte("leader-payload"),
+			ContentId: []byte("cid-x"),
+		}},
+	}
+	if err := rl.Step(msg); err != nil {
+		t.Fatalf("leader step: %v", err)
+	}
+
+	// After the fix:
+	// - fallback should *run*, i.e. append the decision (either at k, replacing noop,
+	//   or at k+1 if your fallback still uses appendEntry), so lastIndex must increase by 1.
+	// - proposalCache[k] should be cleared.
+	// - fastMatchIndex[leader] should count k.
+	lastIdxAfter := rl.raftLog.lastIndex()
+	if lastIdxAfter != lastIdxBefore+1 {
+		t.Fatalf("fallback did not append decision; lastIdx before=%d after=%d", lastIdxBefore, lastIdxAfter)
+	}
+
+	// proposalCache for k should be cleared after install.
+	if rl.proposalCache[noopIdx] != nil {
+		t.Fatalf("proposalCache[%d] not cleared", noopIdx)
+	}
+
+	// Leader should count itself at k toward fast quorum.
+	if rl.fastMatchIndex[rl.id] < noopIdx {
+		t.Fatalf("fastMatchIndex[self]=%d want >= %d", rl.fastMatchIndex[rl.id], noopIdx)
+	}
+
+	// Optional: if your fallback installs *exactly* at k (ideal), validate it replaced the noop.
+	ents, _ := rl.raftLog.slice(noopIdx, noopIdx+1, noLimit)
+	if len(ents) == 1 && len(ents[0].Data) != 0 {
+		if string(ents[0].Data) != "leader-payload" || getOrigin(&ents[0]) != pb.EntryOriginLeader {
+			t.Fatalf("entry at k not leader-approved payload: %+v", ents[0])
+		}
+	} else {
+		// If you still append at k+1, ensure the leader payload is at lastIdxAfter.
+		ents2, _ := rl.raftLog.slice(lastIdxAfter, lastIdxAfter+1, noLimit)
+		if len(ents2) != 1 || string(ents2[0].Data) != "leader-payload" || getOrigin(&ents2[0]) != pb.EntryOriginLeader {
+			t.Fatalf("leader decision not appended properly: %+v", ents2)
+		}
+	}
+}

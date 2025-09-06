@@ -1787,8 +1787,15 @@ func stepLeader(r *raft, m pb.Message) error {
 			bucket = make(map[string]pb.Entry)
 			r.proposalCache[m.Index] = bucket
 		}
+
+		// Local self-proposals come in with From=None (0); treat as leader.
+		from := m.From
+		if from == None {
+			from = r.id
+		}
+
 		// Leader-preferred caching: our own payload must win to preserve Header.ID.
-		if m.From == r.id {
+		if from == r.id {
 			bucket[cid] = e
 		} else {
 			if _, ok := bucket[cid]; !ok {
@@ -1797,10 +1804,10 @@ func stepLeader(r *raft, m pb.Message) error {
 		}
 
 		// classic-fallback when mixed cluster can't produce fast-vote CQ.
-		// If this is the next index k and we haven't installed a leader-approved entry yet,
+		// If this is OUR fast-prop for the next index k and we haven't installed a leader-approved entry yet,
 		// pick this payload and replicate classically. First-wins policy is fine.
 		k := r.raftLog.committed + 1
-		if m.Index == k && !r.hasLeaderApprovedAt(k) {
+		if from == r.id && m.Index == k && !r.hasLeaderApprovedAt(k) {
 			// Materialize leader-approved entry from the cached payload.
 			chosen := bucket[cid]
 			setOrigin(&chosen, pb.EntryOriginLeader) // leader canon

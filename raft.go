@@ -468,6 +468,7 @@ type raft struct {
 	// follower -> highest k they voted for the winner
 	fastMatchIndex map[uint64]uint64
 	electionSelf   map[uint64][]*pb.EntryRef
+	lastFastVote   map[uint64]string
 }
 
 func newRaft(c *Config) *raft {
@@ -501,6 +502,10 @@ func newRaft(c *Config) *raft {
 		enableFastPath:              c.EnableFastPath,
 		enableFastCommit:            c.EnableFastCommit,
 		fastOpenIndexWindow:         c.FastOpenIndexWindow,
+	}
+
+	if r.enableFastPath {
+		r.lastFastVote = make(map[uint64]string)
 	}
 
 	traceInitState(r)
@@ -1079,6 +1084,13 @@ func (r *raft) appliedSnap(snap *pb.Snapshot) {
 	if r.lastLeaderIndex > index {
 		r.lastLeaderIndex = index
 	}
+	if r.enableFastPath && r.lastFastVote != nil {
+		for k := range r.lastFastVote {
+			if k <= index {
+				delete(r.lastFastVote, k)
+			}
+		}
+	}
 }
 
 // maybeCommit attempts to advance the commit index. Returns true if the commit
@@ -1100,6 +1112,14 @@ func (r *raft) reset(term uint64) {
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
 	r.resetRandomizedElectionTimeout()
+
+	if r.lastFastVote == nil {
+		r.lastFastVote = make(map[uint64]string)
+	} else {
+		for k := range r.lastFastVote {
+			delete(r.lastFastVote, k)
+		}
+	}
 
 	r.abortLeaderTransfer()
 
@@ -2336,10 +2356,19 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 		return
 	}
 	if mlastIndex, ok := r.raftLog.maybeAppend(a, m.Commit); ok {
+		// ❑ Fast-path housekeeping: clear vote-dedupe for indices we just accepted.
+		if r.enableFastPath && r.lastFastVote != nil {
+			lo := a.prev.index + 1 // first index carried by this MsgApp
+			hi := mlastIndex
+			for i := lo; i <= hi; i++ {
+				delete(r.lastFastVote, i) // free memory and stop considering old votes for these slots
+			}
+		}
+
 		if r.enableFastPath && mlastIndex > r.lastLeaderIndex {
 			from := m.Index + 1
 			to := mlastIndex
-			// We only need the highest Leader origin; scan backwards and stop at first match.
+			// keep your existing scan to update lastLeaderIndex …
 			for i := to; i >= from && i > r.lastLeaderIndex; i-- {
 				ents, _ := r.raftLog.slice(i, i+1, noLimit)
 				if len(ents) == 1 && (ents[0].Origin == pb.EntryOriginLeader.Enum() || ents[0].Origin == pb.EntryOriginUnknown.Enum()) {
@@ -2348,12 +2377,14 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 				}
 				if i == 0 {
 					break
-				} // guard underflow
+				}
 			}
 		}
+
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: mlastIndex})
 		return
 	}
+
 	r.logger.Debugf("%x [logterm: %d, index: %d] rejected MsgApp [logterm: %d, index: %d] from %x",
 		r.id, r.raftLog.zeroTermOnOutOfBounds(r.raftLog.term(m.Index)), m.Index, m.LogTerm, m.Index, m.From)
 
@@ -2622,22 +2653,47 @@ func (r *raft) abortLeaderTransfer() {
 }
 
 // follower helper called after self-insert
+// follower helper called after self-insert (or on duplicate fast prop)
 func (r *raft) sendFastVoteForIndex(m pb.Message) {
-	fmt.Printf("sendFastVoteForIndex: enableFastPath=%v lead=%d len(m.Entries)=%d\n", r.enableFastPath, r.lead, len(m.Entries))
+	// REMOVE: fmt.Printf(...) – this is extremely hot.
 	if !r.enableFastPath || r.lead == None || len(m.Entries) == 0 {
 		return
 	}
+
+	idx := m.Index
+	if idx == 0 || idx <= r.raftLog.committed {
+		return // never vote for committed/past indices
+	}
+	// Optional: enforce window on the vote path too.
+	win := r.fastOpenIndexWindow
+	if win <= 0 {
+		win = 1
+	}
+	if idx > r.raftLog.committed+uint64(win) {
+		return
+	}
+
 	cid := m.Entries[0].ContentId
 	if len(cid) == 0 {
 		return
 	}
+	key := string(cid)
 
-	// EntryRef.Index is *uint64 in your generated code — pass a pointer.
-	idx := m.Index // local variable so &idx is stable
-	ref := &pb.EntryRef{Index: &idx, ContentId: cid}
+	// ✅ Deduplicate: one vote per (index, contentId)
+	if prev, ok := r.lastFastVote[idx]; ok && prev == key {
+		return // already voted for this candidate at this index
+	}
+	r.lastFastVote[idx] = key
 
-	// LocalCommit is *uint64 in your generated code — pass a pointer.
+	// Build the vote
 	lc := r.raftLog.committed
+	// NB: in your proto EntryRef.Index is *uint64; use a local var for a stable pointer.
+	i := idx
+	ref := &pb.EntryRef{
+		Index:     &i,
+		ContentId: cid,
+		Origin:    pb.EntryOriginSelf.Enum(), // optional but nice
+	}
 
 	r.send(pb.Message{
 		To:          r.lead,

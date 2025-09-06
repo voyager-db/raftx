@@ -292,3 +292,115 @@ func TestSnapshot_InstallAcrossMixedOrigins_UpdatesFrontier(t *testing.T) {
 	// Ensure subsequent elections will use the new frontier (no direct assert here;
 	// just make sure recompute didn't panic and value is within bound).
 }
+
+// When the *total* fast votes at k reach a classic quorum but the top content
+// has < quorum (e.g., 2-2 split on 5 nodes), the leader should still choose a
+// decision at k and replicate classically.
+func TestFastDecision_SplitVotes_ClassicDecisionOnTotalQuorum(t *testing.T) {
+	voters := mkVoters(5)
+	r := newLeader(t, voters, 1, raftOpts{
+		enableFastPath:   true,
+		enableFastCommit: false, // keep it purely "decide + classic replicate"
+	})
+
+	// Build a committed prefix and choose k.
+	appendLeaderEntries(t, r, 3)
+	r.raftLog.commitTo(3)
+	k := r.raftLog.committed + 1 // 4
+
+	// Seed payloads the leader can materialize for each content id.
+	if r.proposalCache[k] == nil {
+		r.proposalCache[k] = make(map[string]pb.Entry)
+	}
+	r.proposalCache[k]["A"] = pb.Entry{
+		Type:      pb.EntryNormal,
+		ContentId: []byte("A"),
+		Data:      []byte("value-A"),
+	}
+	r.proposalCache[k]["B"] = pb.Entry{
+		Type:      pb.EntryNormal,
+		ContentId: []byte("B"),
+		Data:      []byte("value-B"),
+	}
+
+	// Split votes at k: A from 2,3; B from 4,5. Total voters at k = 4 (≥ CQ=3).
+	r.possibleEntries[k] = map[string]map[uint64]struct{}{
+		"A": {2: {}, 3: {}},
+		"B": {4: {}, 5: {}},
+	}
+	r.fastVoterChoice[k] = map[uint64]string{
+		2: "A", 3: "A", 4: "B", 5: "B",
+	}
+
+	// Run the decision loop: with the FIX, totalVotes>=CQ ⇒ decide at k.
+	r.maybeDecideAtKClassicOnly()
+
+	// Assert leader appended a leader-approved entry at k.
+	ent := entryAt(t, r, k)
+	if !bytes.Equal(ent.ContentId, []byte("A")) {
+		// Tie-break is lexicographic, so "A" wins deterministically.
+		t.Fatalf("decided cid at k=%d = %q, want %q", k, string(ent.ContentId), "A")
+	}
+	if ent.Origin == nil || *ent.Origin != pb.EntryOriginLeader {
+		t.Fatalf("origin at k=%d = %v, want Leader", k, ent.Origin)
+	}
+
+	// Buckets at k should be cleared (no more voting at k after decision).
+	if _, ok := r.possibleEntries[k]; ok {
+		t.Fatalf("possibleEntries not cleared at k=%d", k)
+	}
+	if _, ok := r.fastVoterChoice[k]; ok {
+		t.Fatalf("fastVoterChoice not cleared at k=%d", k)
+	}
+	if _, ok := r.proposalCache[k]; ok {
+		t.Fatalf("proposalCache not cleared at k=%d", k)
+	}
+
+	// Not committed yet (we didn't simulate acks). Simulate classic acks and commit.
+	setMajorityMatchAt(r, k)
+	if !r.maybeCommit() {
+		t.Fatalf("maybeCommit did not advance after classic majority matched")
+	}
+	if r.raftLog.committed != k {
+		t.Fatalf("commit=%d, want %d", r.raftLog.committed, k)
+	}
+}
+
+// A companion negative test: if total votes at k < CQ, leader must NOT decide.
+func TestFastDecision_NotEnoughTotalVotes_NoDecision(t *testing.T) {
+	voters := mkVoters(5)
+	r := newLeader(t, voters, 1, raftOpts{
+		enableFastPath:   true,
+		enableFastCommit: false,
+	})
+
+	// After becomeLeader(), there's one empty entry. Fence k at the current tail+1.
+	lastBefore := r.raftLog.lastIndex()
+	r.raftLog.commitTo(lastBefore)
+	k := lastBefore + 1
+
+	// Only 2 total voters at k (below CQ=3 for 5 voters) -> must NOT decide.
+	r.possibleEntries[k] = map[string]map[uint64]struct{}{
+		"A": {2: {}},
+		"B": {3: {}},
+	}
+	r.fastVoterChoice[k] = map[uint64]string{2: "A", 3: "B"}
+
+	r.maybeDecideAtKClassicOnly()
+
+	// Assert: the log tail did not grow (i.e. no append at k).
+	lastAfter := r.raftLog.lastIndex()
+	if lastAfter != lastBefore {
+		t.Fatalf("unexpected append with totalVotes<CQ: lastIndex %d -> %d", lastBefore, lastAfter)
+	}
+	// Optional: no leader-approved frontier movement either.
+	// (Keep this only if lastLeaderIndex should remain unchanged in your impl.)
+	// if r.lastLeaderIndex != 0 && r.lastLeaderIndex > lastBefore {
+	// 	t.Fatalf("unexpected lastLeaderIndex movement to %d", r.lastLeaderIndex)
+	// }
+
+	// Optional: decision buckets still present (we didn't pick a winner).
+	if _, ok := r.possibleEntries[k]; !ok {
+		t.Fatalf("possibleEntries[k] cleared despite no decision")
+	}
+}

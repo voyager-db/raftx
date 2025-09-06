@@ -630,16 +630,16 @@ func (r *raft) quorumThreshold() int {
 	return len(ids)/2 + 1
 }
 
+// MUST NOT synthesize leader entries if we don't have a cached payload.
+// If there is no payload cached for (k, cid), return ok=false.
 func (r *raft) materializeDecision(k uint64, cid string) (pb.Entry, bool) {
 	if m := r.proposalCache[k]; m != nil {
 		if e, ok := m[cid]; ok {
-			// Ensure leader-origin on install; Index/Term set by caller.
 			e.Origin = pb.EntryOriginLeader.Enum()
 			e.Index, e.Term = 0, 0
 			return e, true
 		}
 	}
-	// No payload yet — do NOT synthesize an empty entry.
 	return pb.Entry{}, false
 }
 
@@ -666,7 +666,26 @@ func (r *raft) maybeDecideAtKClassicOnly() {
 		return
 	}
 
-	// argmax + deterministic tie-break on contentId (lexicographic)
+	// --- NEW: total unique voters at k ---
+	totalVotes := 0
+	if choices := r.fastVoterChoice[k]; choices != nil {
+		totalVotes = len(choices)
+	} else {
+		// Fallback: union the voter sets if fastVoterChoice is not populated.
+		seen := make(map[uint64]struct{})
+		for _, set := range bucket {
+			for v := range set {
+				seen[v] = struct{}{}
+			}
+		}
+		totalVotes = len(seen)
+	}
+	if totalVotes < r.quorumThreshold() {
+		return // not enough participation at k yet
+	}
+	// -------------------------------------
+
+	// Argmax with deterministic tie-break.
 	var winnerCID string
 	var winnerCnt int
 	for cid, voters := range bucket {
@@ -675,22 +694,15 @@ func (r *raft) maybeDecideAtKClassicOnly() {
 			winnerCID, winnerCnt = cid, cnt
 		}
 	}
-	if winnerCnt < r.quorumThreshold() {
-		return // not enough yet to pick a decision
-	}
 
-	// materialize entry for k
+	// Materialize leader-approved entry at k.
 	e, ok := r.materializeDecision(k, winnerCID)
 	if !ok {
-		return
+		return // leader payload not cached yet (should be rare)
 	}
-
-	// install decision at exactly index k (overwrite any unstable tail)
-	// (raftLog.append will truncate-and-append from k)
-	e.Index = k
-	e.Term = r.Term
+	e.Index, e.Term = k, r.Term
 	if e.Origin == nil || *e.Origin == pb.EntryOriginUnknown {
-		e.Origin = pb.EntryOriginLeader.Enum()
+		setOrigin(&e, pb.EntryOriginLeader)
 	}
 	if !r.increaseUncommittedSize([]pb.Entry{e}) {
 		return
@@ -700,24 +712,25 @@ func (r *raft) maybeDecideAtKClassicOnly() {
 		r.lastLeaderIndex = k
 	}
 
-	delete(r.proposalCache, k)
-
-	// mark winners
+	// Credit winner’s voters for fast-commit checks.
 	for voter := range bucket[winnerCID] {
 		if r.fastMatchIndex[voter] < k {
 			r.fastMatchIndex[voter] = k
 		}
 	}
 
-	// content-level dedupe across other indices
+	// Cleanup: dedupe & drop all tallies/caches for k.
 	r.nullDuplicates(winnerCID, k)
+	delete(r.possibleEntries, k)
+	delete(r.fastVoterChoice, k)
+	delete(r.proposalCache, k)
 
-	// replicate classically (regular MaybeCommit will advance when matchIndex wins)
+	// Replicate classically; fast-commit if FQ & term-guard met.
 	r.bcastAppend()
-	_ = r.tryFastCommit(k) // safe no-op when flag off or condition not met
+	_ = r.tryFastCommit(k)
 
-	// optional structured log
-	r.logger.Infof("[fast] decision chosen at k=%d cid=%q votes=%d path=classic", k, winnerCID, winnerCnt)
+	r.logger.Infof("[fast] decision chosen at k=%d cid=%q votes_total=%d winner_votes=%d path=classic",
+		k, winnerCID, totalVotes, winnerCnt)
 }
 
 func (r *raft) tryFastCommit(k uint64) bool {
@@ -1849,7 +1862,7 @@ func stepLeader(r *raft, m pb.Message) error {
 		}
 
 		// Classic fallback only on OUR own fast-prop for k.
-		if from == r.id && (!r.hasLeaderApprovedAt(k) || r.leaderEntryAtKIsNoop(k)) {			// Materialize leader-approved entry from the cached payload.
+		if from == r.id && (!r.hasLeaderApprovedAt(k) || r.leaderEntryAtKIsNoop(k)) { // Materialize leader-approved entry from the cached payload.
 			chosen := bucket[cid]
 			setOrigin(&chosen, pb.EntryOriginLeader) // leader canon
 			chosen.Index = 0                         // appendEntry sets Index/Term

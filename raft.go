@@ -660,6 +660,8 @@ func (r *raft) maybeDecideAtKClassicOnly() {
 		r.lastLeaderIndex = k
 	}
 
+	delete(r.proposalCache, k)
+
 	// mark winners
 	for voter := range bucket[winnerCID] {
 		if r.fastMatchIndex[voter] < k {
@@ -1774,18 +1776,21 @@ func stepLeader(r *raft, m pb.Message) error {
 		if !r.enableFastPath {
 			return nil
 		}
-		if m.Index == 0 || len(m.Entries) == 0 {
+		if len(m.Entries) == 0 {
 			return nil
 		}
+
 		e := m.Entries[0]
 		cid := string(e.ContentId)
 		if cid == "" {
 			return nil
 		}
-		bucket := r.proposalCache[m.Index]
+		// Always operate at the leader's current k; ignore m.Index.
+		k := r.raftLog.committed + 1
+		bucket := r.proposalCache[k]
 		if bucket == nil {
 			bucket = make(map[string]pb.Entry)
-			r.proposalCache[m.Index] = bucket
+			r.proposalCache[k] = bucket
 		}
 
 		// Local self-proposals come in with From=None (0); treat as leader.
@@ -1803,11 +1808,8 @@ func stepLeader(r *raft, m pb.Message) error {
 			}
 		}
 
-		// classic-fallback when mixed cluster can't produce fast-vote CQ.
-		// If this is OUR fast-prop for the next index k and we haven't installed a leader-approved entry yet,
-		// pick this payload and replicate classically. First-wins policy is fine.
-		k := r.raftLog.committed + 1
-		if from == r.id && m.Index == k && !r.hasLeaderApprovedAt(k) {
+		// Classic fallback only on OUR own fast-prop for k.
+		if from == r.id && !r.hasLeaderApprovedAt(k) {
 			// Materialize leader-approved entry from the cached payload.
 			chosen := bucket[cid]
 			setOrigin(&chosen, pb.EntryOriginLeader) // leader canon
@@ -1818,6 +1820,7 @@ func stepLeader(r *raft, m pb.Message) error {
 				// We’ve chosen; clear fast buckets at k (no more voting at k).
 				delete(r.possibleEntries, k)
 				delete(r.fastVoterChoice, k)
+				delete(r.proposalCache, k)
 				// Count ourselves toward any later fast-commit checks (harmless).
 				if r.fastMatchIndex[r.id] < k {
 					r.fastMatchIndex[r.id] = k
@@ -1831,41 +1834,41 @@ func stepLeader(r *raft, m pb.Message) error {
 			return nil
 		}
 		for _, ref := range m.FastVotes {
-			if ref == nil || ref.Index == nil {
+			if ref == nil || len(ref.ContentId) == 0 {
 				continue
 			}
-			idx := *ref.Index
-			if idx == 0 || idx <= r.raftLog.committed {
-				continue
-			}
+
+			k := r.raftLog.committed + 1
+
 			if len(ref.ContentId) == 0 {
 				continue
 			}
+
 			cid := string(ref.ContentId)
 
-			if r.possibleEntries[idx] == nil {
-				r.possibleEntries[idx] = make(map[string]map[uint64]struct{})
+			if r.possibleEntries[k] == nil {
+				r.possibleEntries[k] = make(map[string]map[uint64]struct{})
 			}
-			if r.fastVoterChoice[idx] == nil {
-				r.fastVoterChoice[idx] = make(map[uint64]string)
+			if r.fastVoterChoice[k] == nil {
+				r.fastVoterChoice[k] = make(map[uint64]string)
 			}
 
 			voter := m.From
-			if prev, ok := r.fastVoterChoice[idx][voter]; ok && prev != cid {
-				if set := r.possibleEntries[idx][prev]; set != nil {
+			if prev, ok := r.fastVoterChoice[k][voter]; ok && prev != cid {
+				if set := r.possibleEntries[k][prev]; set != nil {
 					delete(set, voter)
 					if len(set) == 0 {
-						delete(r.possibleEntries[idx], prev)
+						delete(r.possibleEntries[k], prev)
 					}
 				}
 			}
-			set := r.possibleEntries[idx][cid]
+			set := r.possibleEntries[k][cid]
 			if set == nil {
 				set = make(map[uint64]struct{})
-				r.possibleEntries[idx][cid] = set
+				r.possibleEntries[k][cid] = set
 			}
 			set[voter] = struct{}{}
-			r.fastVoterChoice[idx][voter] = cid
+			r.fastVoterChoice[k][voter] = cid
 
 			// Optional: read follower's view of commit, if you care.
 			// var followerCommit uint64
